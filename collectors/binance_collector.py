@@ -54,14 +54,22 @@ log = logging.getLogger(__name__)
 # ccxt-based collectors (OI, Funding)
 # ---------------------------------------------------------------------------
 
-def collect_oi(exchange: ccxt.binance, coin: str) -> dict | None:
-    """Fetch open interest via ccxt."""
+def collect_oi(exchange: ccxt.binance, coin: str, mark_price: float | None = None) -> dict | None:
+    """Fetch open interest via ccxt. mark_price used to calculate USD value."""
     symbol = binance_ccxt_symbol(coin)
     try:
         oi = exchange.fetch_open_interest(symbol)
+        oi_amount = float(oi.get("openInterestAmount") or 0)
+        oi_value = oi.get("openInterestValue")
+        if oi_value is not None:
+            oi_usd = float(oi_value)
+        elif mark_price and mark_price > 0:
+            oi_usd = oi_amount * mark_price
+        else:
+            oi_usd = 0
         return {
-            "open_interest": float(oi.get("openInterestAmount", 0)),
-            "open_interest_usd": float(oi.get("openInterestValue", 0)),
+            "open_interest": oi_amount,
+            "open_interest_usd": oi_usd,
             "timestamp": datetime.fromtimestamp(
                 oi["timestamp"] / 1000, tz=timezone.utc
             ) if oi.get("timestamp") else datetime.now(timezone.utc),
@@ -177,24 +185,25 @@ async def run_collection(cfg: Config) -> None:
             log.info("Collecting %s ...", coin)
             symbol_display = binance_raw_symbol(coin)
 
-            # OI (sync via ccxt)
-            oi = collect_oi(exchange, coin)
-            if oi:
-                with get_conn() as conn:
-                    insert_binance_oi(
-                        conn, coin, oi["timestamp"],
-                        oi["open_interest"], oi["open_interest_usd"],
-                    )
-            else:
-                errors += 1
-
-            # Funding (sync via ccxt)
+            # Funding first (need mark_price for OI USD calculation)
             funding = collect_funding(exchange, coin)
+            mark_price = funding["mark_price"] if funding else None
             if funding:
                 with get_conn() as conn:
                     insert_binance_funding(
                         conn, coin, funding["timestamp"],
                         funding["funding_rate"], funding["mark_price"],
+                    )
+            else:
+                errors += 1
+
+            # OI (sync via ccxt, uses mark_price for USD calc)
+            oi = collect_oi(exchange, coin, mark_price=mark_price)
+            if oi:
+                with get_conn() as conn:
+                    insert_binance_oi(
+                        conn, coin, oi["timestamp"],
+                        oi["open_interest"], oi["open_interest_usd"],
                     )
             else:
                 errors += 1
