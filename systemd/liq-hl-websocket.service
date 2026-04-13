@@ -1,0 +1,19 @@
+[Unit]
+Description=Liquidation Bot - Hyperliquid Websocket
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ivan
+WorkingDirectory=/home/ivan/liquidation-bot
+ExecStart=/home/ivan/liquidation-bot/.venv/bin/python -m collectors.hl_websocket
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/ivan/liquidation-bot/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=liq-hl-ws
+
+[Install]
+WantedBy=multi-user.target

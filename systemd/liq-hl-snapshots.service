@@ -1,0 +1,15 @@
+[Unit]
+Description=Liquidation Bot - Hyperliquid Snapshots
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ivan
+WorkingDirectory=/home/ivan/liquidation-bot
+ExecStart=/home/ivan/liquidation-bot/.venv/bin/python -m collectors.hl_snapshots
+EnvironmentFile=/home/ivan/liquidation-bot/.env
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=liq-hl-snap
