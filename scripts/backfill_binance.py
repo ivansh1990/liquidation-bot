@@ -87,10 +87,16 @@ def ensure_unique_constraints() -> None:
                     log.info("Deduped %s: removed %d duplicate row(s)", tbl, cur.rowcount)
                     total_deleted += cur.rowcount
             for tbl, cname in _BINANCE_TABLES:
+                # duplicate_object → constraint name already exists.
+                # duplicate_table → implicit index with that name already exists.
+                # Both mean the UNIQUE is in place; nothing to do.
                 cur.execute(
                     f"DO $$ BEGIN "
                     f"ALTER TABLE {tbl} ADD CONSTRAINT {cname} UNIQUE (timestamp, symbol); "
-                    f"EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+                    f"EXCEPTION "
+                    f"WHEN duplicate_object THEN NULL; "
+                    f"WHEN duplicate_table THEN NULL; "
+                    f"END $$"
                 )
     log.info(
         "UNIQUE(timestamp, symbol) constraints ensured on all 4 tables "
