@@ -213,7 +213,11 @@ class SignalComputer:
                 fetch_failed = True
             else:
                 latest_ts = df.index[-1]
-                if latest_ts.to_pydatetime() != expected_bar:
+                # Staleness gate: only reject if the newest bar is OLDER than
+                # the most-recent fully-closed 4H bucket. CoinGlass may also
+                # return the current in-progress bar (latest > expected) — that
+                # is NOT stale; accept it and use its z-score as-is.
+                if latest_ts.to_pydatetime() < expected_bar:
                     log.warning(
                         "stale data for %s: latest=%s expected=%s",
                         coin, latest_ts.isoformat(), expected_bar.isoformat(),

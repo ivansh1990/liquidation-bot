@@ -308,6 +308,36 @@ async def test_signal_end_to_end() -> None:
         f"got {res_stale['is_market_flush']}",
     )
 
+    # --- In-progress bar (latest_ts > expected): NOT stale, must be accepted. ---
+    inprog_idx = pd.date_range(
+        end=expected_bar + timedelta(hours=4),
+        periods=95, freq="4h", tz="UTC",
+    )
+    inprog = {
+        c: canned[c].set_axis(inprog_idx).rename_axis(canned[c].index.name)
+        for c in coin_plan
+    }
+
+    async def mock_inprog_fetch(self, session, coin, n_bars=100):
+        return inprog[coin]
+
+    with patch.object(
+        SignalComputer, "fetch_recent_liquidations",
+        new=mock_inprog_fetch,
+    ), patch("asyncio.sleep", new=lambda *a, **kw: _noop_awaitable()):
+        res_inprog = await sig.check_market_flush(session=None)
+
+    report(
+        "in-progress last-bar (newer than expected) → fetch_failed=False",
+        res_inprog["fetch_failed"] is False,
+        f"got {res_inprog['fetch_failed']}",
+    )
+    report(
+        "in-progress last-bar → is_market_flush=True",
+        res_inprog["is_market_flush"] is True,
+        f"got {res_inprog['is_market_flush']}",
+    )
+
 
 async def _noop_awaitable():
     return None
