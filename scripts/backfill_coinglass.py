@@ -79,10 +79,14 @@ async def fetch_liquidations(
         records = data["data"]
         all_records.extend(records)
 
-        if len(records) < 500:
+        # CoinGlass v4 aggregated-history returns up to 1000 records per call.
+        if len(records) < 1000:
             break
 
-        current_start = int(records[-1]["time"]) + 1
+        # Advance cursor. Normalize ms → s if the API returns ms.
+        last_t = int(records[-1]["time"])
+        last_sec = last_t // 1000 if last_t > 10**12 else last_t
+        current_start = last_sec + 1
         await asyncio.sleep(REQUEST_SLEEP_S)
 
     return all_records
@@ -160,15 +164,23 @@ async def main() -> None:
                 await asyncio.sleep(REQUEST_SLEEP_S)
                 continue
 
-            # Build rows with null-tolerant float conversion
+            # Build rows with null-tolerant conversion.
+            # CoinGlass v4 aggregated-history response shape:
+            #   {"time": <ms>, "aggregated_long_liquidation_usd": ...,
+            #    "aggregated_short_liquidation_usd": ...}
+            # No count fields are returned on this endpoint → default 0.
             rows = []
             for r in records:
-                ts = datetime.fromtimestamp(int(r["time"]), tz=timezone.utc)
+                t_raw = int(r["time"])
+                t_sec = t_raw / 1000 if t_raw > 10**12 else t_raw
+                ts = datetime.fromtimestamp(t_sec, tz=timezone.utc)
                 rows.append((
                     ts,
                     coin,
-                    float(r.get("longVolUsd") or 0),
-                    float(r.get("shortVolUsd") or 0),
+                    float(r.get("aggregated_long_liquidation_usd")
+                          or r.get("longVolUsd") or 0),
+                    float(r.get("aggregated_short_liquidation_usd")
+                          or r.get("shortVolUsd") or 0),
                     int(r.get("longCount") or 0),
                     int(r.get("shortCount") or 0),
                 ))
