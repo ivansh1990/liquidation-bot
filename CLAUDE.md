@@ -18,6 +18,8 @@ liquidation-bot/
 │   ├── seed_addresses.py   — Seed whale addresses from leaderboard
 │   ├── test_collectors.py  — Integration test for all endpoints
 │   ├── backfill_binance.py — Backfill last 30 days of Binance history (one-shot)
+│   ├── backfill_coinglass.py — Backfill 180 days of CoinGlass aggregated liquidations (one-shot)
+│   ├── backtest_liquidation_flush.py — H1/H2/H3 backtest: liquidation asymmetry → reversal
 │   └── quick_analysis.py   — Data analysis (run after 2+ days)
 ├── systemd/                — Service and timer files for VPS
 └── analysis/               — Generated reports (gitignored)
@@ -52,6 +54,14 @@ BTC, ETH, SOL, DOGE, LINK, AVAX, SUI, ARB, WIF, PEPE
 
 **Important**: L/S ratio and taker endpoints use `/futures/data/` path, NOT `/fapi/v1/`.
 
+### CoinGlass (requires API key)
+- Base: `https://open-api-v4.coinglass.com`
+- Aggregated liquidations: `GET /api/futures/liquidation/aggregated-history?symbol=BTC&interval=h4`
+- Header: `CG-API-KEY: <key>`
+- Rate limit: 30 req/min on Hobbyist tier → collectors pause 2.5s between requests
+- Historical range on Hobbyist: 180 days at h4 interval (~1080 records/coin)
+- Symbol format: base name (`BTC`, `ETH`, ...); `PEPE` may require `1000PEPE` fallback — `backfill_coinglass.py` tries the primary name first and falls back automatically.
+
 ## Database Schema (PostgreSQL `liquidation`)
 
 | Table | Purpose | Key Fields |
@@ -63,10 +73,13 @@ BTC, ETH, SOL, DOGE, LINK, AVAX, SUI, ARB, WIF, PEPE
 | `binance_funding` | Funding Rate | symbol, funding_rate, mark_price |
 | `binance_ls_ratio` | Long/Short Ratio | symbol, long_account_pct, short_account_pct |
 | `binance_taker` | Taker Buy/Sell | symbol, buy_vol, sell_vol, buy_sell_ratio |
+| `coinglass_liquidations` | Aggregated liquidations (4H) | symbol, long_vol_usd, short_vol_usd, long_count, short_count |
 
 `is_liq_estimated` in `hl_position_snapshots`: `FALSE` = liquidation price from API, `TRUE` = estimated via `entry_px * (1 ± 1/leverage)`. Filter with `WHERE NOT is_liq_estimated` for analysis requiring precise data.
 
 The four `binance_*` tables gain a `UNIQUE(timestamp, symbol)` constraint the first time `scripts/backfill_binance.py` runs (added lazily via `ALTER TABLE ... ADD CONSTRAINT`). This makes backfill + hourly collector coexist safely through `ON CONFLICT DO NOTHING`.
+
+`coinglass_liquidations` is created by `scripts/backfill_coinglass.py` (inline `CREATE TABLE IF NOT EXISTS` with `CONSTRAINT uq_cg_liq UNIQUE (timestamp, symbol)`). There is no hourly CoinGlass collector yet — we only backfill and backtest until edge is confirmed.
 
 ## Running Locally
 
@@ -87,6 +100,14 @@ cp .env.example .env
 # One-shot historical backfill (last 30 days of Binance futures data)
 # Idempotent: safe to rerun and to run alongside the hourly collector.
 .venv/bin/python scripts/backfill_binance.py --days 30
+
+# One-shot CoinGlass liquidation backfill (180 days, 4H interval).
+# Requires LIQ_COINGLASS_API_KEY in .env. Idempotent.
+.venv/bin/python scripts/backfill_coinglass.py --days 180
+
+# Backtest H1/H2/H3: liquidation flush → reversal.
+# Reads coinglass_liquidations + fetches Binance 4H klines via ccxt on-the-fly.
+.venv/bin/python scripts/backtest_liquidation_flush.py
 ```
 
 ## VPS Deployment
@@ -132,10 +153,11 @@ sudo systemctl restart liq-hl-websocket
 All prefixed with `LIQ_`:
 - `LIQ_DB_HOST`, `LIQ_DB_PORT`, `LIQ_DB_NAME`, `LIQ_DB_USER`, `LIQ_DB_PASSWORD`
 - `LIQ_TELEGRAM_BOT_TOKEN`, `LIQ_TELEGRAM_CHAT_ID`
+- `LIQ_COINGLASS_API_KEY` — CoinGlass Hobbyist-tier API key (required for `backfill_coinglass.py`)
 
 ## Constraints
 
 - No imports from `crypto-regime-bot` (separate project)
-- No API keys needed (all endpoints are public)
+- All Hyperliquid and Binance endpoints are public (no API key needed); CoinGlass requires a free Hobbyist-tier key
 - No Docker
-- No trading/strategy logic — data collection only
+- No trading/strategy logic — data collection + offline backtesting only

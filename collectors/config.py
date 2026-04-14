@@ -100,6 +100,9 @@ class Config(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    # CoinGlass
+    coinglass_api_key: str = ""
+
 
 @lru_cache
 def get_config() -> Config:
