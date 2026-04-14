@@ -59,66 +59,61 @@ async def fetch_liquidations(
     end_ts: int,
     verbose: bool = False,
 ) -> list[dict]:
-    """Fetch aggregated liquidation history (4H) for a symbol, paginated."""
+    """
+    Fetch aggregated liquidation history (4H) for a symbol.
+
+    CoinGlass v4 `aggregated-history` ignores `startTime`/`endTime` on the
+    Hobbyist tier and returns the latest ≤1000 buckets unconditionally. So
+    this is a single request; we still pass the time params defensively.
+    """
     url = f"{CG_BASE}/aggregated-history"
     headers = {"CG-API-KEY": api_key}
-    all_records: list[dict] = []
-    current_start = start_ts
-    page = 0
+    params = {
+        "symbol": symbol_cg,
+        "interval": "h4",
+        "exchange_list": CG_EXCHANGES,
+        "startTime": start_ts,
+        "endTime": end_ts,
+    }
 
-    while current_start < end_ts:
-        page += 1
-        params = {
-            "symbol": symbol_cg,
-            "interval": "h4",
-            "exchange_list": CG_EXCHANGES,
-            "startTime": current_start,
-            "endTime": end_ts,
-        }
-        t0 = time.monotonic()
-        if verbose:
-            print(
-                f"    → GET page {page}  startTime={current_start}  "
-                f"({datetime.fromtimestamp(current_start, tz=timezone.utc).date()})"
-            )
-        try:
-            async with session.get(
-                url, headers=headers, params=params,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                status = resp.status
-                data = await resp.json()
-        except asyncio.TimeoutError:
-            print(f"    ❌ Timeout on {symbol_cg} page {page}")
-            break
-        except Exception as e:
-            print(f"    ❌ HTTP error on {symbol_cg} page {page}: {e}")
-            break
+    t0 = time.monotonic()
+    if verbose:
+        print(f"    → GET {symbol_cg}  startTime={start_ts} endTime={end_ts}")
+    try:
+        async with session.get(
+            url, headers=headers, params=params,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            status = resp.status
+            data = await resp.json()
+    except asyncio.TimeoutError:
+        print(f"    ❌ Timeout on {symbol_cg}")
+        return []
+    except Exception as e:
+        print(f"    ❌ HTTP error on {symbol_cg}: {e}")
+        return []
 
-        elapsed = time.monotonic() - t0
-        if verbose:
-            print(f"    ← HTTP {status} in {elapsed:.1f}s, code={data.get('code')}")
+    elapsed = time.monotonic() - t0
+    if verbose:
+        print(f"    ← HTTP {status} in {elapsed:.1f}s, code={data.get('code')}")
 
-        if data.get("code") != "0" or not data.get("data"):
-            print(f"  Warning: {data.get('msg', 'empty')} for {symbol_cg}")
-            break
+    if data.get("code") != "0" or not data.get("data"):
+        print(f"  Warning: {data.get('msg', 'empty')} for {symbol_cg}")
+        return []
 
-        records = data["data"]
-        all_records.extend(records)
-        if verbose:
-            print(f"    page {page}: +{len(records)} records (total {len(all_records)})")
+    records = data["data"]
 
-        # CoinGlass v4 aggregated-history returns up to 1000 records per call.
-        if len(records) < 1000:
-            break
+    # Client-side filter to the requested [start_ts, end_ts] window in case
+    # the API returned outside it. Normalize ms→s.
+    def _t(r: dict) -> int:
+        t = int(r["time"])
+        return t // 1000 if t > 10**12 else t
 
-        # Advance cursor. Normalize ms → s if the API returns ms.
-        last_t = int(records[-1]["time"])
-        last_sec = last_t // 1000 if last_t > 10**12 else last_t
-        current_start = last_sec + 1
-        await asyncio.sleep(REQUEST_SLEEP_S)
+    records = [r for r in records if start_ts <= _t(r) <= end_ts]
+    if verbose:
+        print(f"    → {len(records)} records in window")
 
-    return all_records
+    return records
 
 
 def ensure_table() -> None:
