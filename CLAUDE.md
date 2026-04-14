@@ -19,6 +19,7 @@ liquidation-bot/
 │   ├── test_collectors.py  — Integration test for all endpoints
 │   ├── backfill_binance.py — Backfill last 30 days of Binance history (one-shot)
 │   ├── backfill_coinglass.py — Backfill 180 days of CoinGlass aggregated liquidations (one-shot)
+│   ├── backfill_coinglass_oi.py — Backfill 180 days of CoinGlass aggregated OI + funding (one-shot)
 │   ├── backtest_liquidation_flush.py — H1/H2/H3 backtest: liquidation asymmetry → reversal (L2 baseline, locked)
 │   ├── walkforward_h1_flush.py — L3: 6-fold expanding-window walk-forward validation of H1
 │   ├── backtest_h1_with_stops.py — L3: ATR-based TP/SL grid (64 configs/coin) using H1 entries
@@ -60,10 +61,13 @@ BTC, ETH, SOL, DOGE, LINK, AVAX, SUI, ARB, WIF, PEPE
 ### CoinGlass (requires API key)
 - Base: `https://open-api-v4.coinglass.com`
 - Aggregated liquidations: `GET /api/futures/liquidation/aggregated-history?symbol=BTC&interval=h4`
+- Aggregated OI OHLC: `GET /api/futures/open-interest/aggregated-history?symbol=BTC&interval=h4`
+- Funding rate OHLC: `GET /api/futures/funding-rate/oi-weight-ohlc-history?symbol=BTC&interval=h8` (fallbacks: `/funding-rate/aggregated-history`, `interval=h4`)
 - Header: `CG-API-KEY: <key>`
 - Rate limit: 30 req/min on Hobbyist tier → collectors pause 2.5s between requests
-- Historical range on Hobbyist: 180 days at h4 interval (~1080 records/coin)
-- Symbol format: base name (`BTC`, `ETH`, ...); `PEPE` may require `1000PEPE` fallback — `backfill_coinglass.py` tries the primary name first and falls back automatically.
+- Historical range on Hobbyist: 180 days at h4 interval (~1080 records/coin); funding at h8 ≈ 540/coin
+- Hobbyist-tier quirk: aggregated endpoints ignore `startTime`/`endTime` and return the latest ≤1000 buckets — so backfills use a single request per coin and filter the window client-side.
+- Symbol format: base name (`BTC`, `ETH`, ...); `PEPE` may require `1000PEPE` fallback — both `backfill_coinglass.py` and `backfill_coinglass_oi.py` try the primary name first and fall back automatically.
 
 ## Database Schema (PostgreSQL `liquidation`)
 
@@ -77,12 +81,16 @@ BTC, ETH, SOL, DOGE, LINK, AVAX, SUI, ARB, WIF, PEPE
 | `binance_ls_ratio` | Long/Short Ratio | symbol, long_account_pct, short_account_pct |
 | `binance_taker` | Taker Buy/Sell | symbol, buy_vol, sell_vol, buy_sell_ratio |
 | `coinglass_liquidations` | Aggregated liquidations (4H) | symbol, long_vol_usd, short_vol_usd, long_count, short_count |
+| `coinglass_oi` | Aggregated OI OHLC (4H) | symbol, open_interest (close), oi_high, oi_low |
+| `coinglass_funding` | Aggregated funding rate (8H or 4H) | symbol, funding_rate |
 
 `is_liq_estimated` in `hl_position_snapshots`: `FALSE` = liquidation price from API, `TRUE` = estimated via `entry_px * (1 ± 1/leverage)`. Filter with `WHERE NOT is_liq_estimated` for analysis requiring precise data.
 
 The four `binance_*` tables gain a `UNIQUE(timestamp, symbol)` constraint the first time `scripts/backfill_binance.py` runs (added lazily via `ALTER TABLE ... ADD CONSTRAINT`). This makes backfill + hourly collector coexist safely through `ON CONFLICT DO NOTHING`.
 
 `coinglass_liquidations` is created by `scripts/backfill_coinglass.py` (inline `CREATE TABLE IF NOT EXISTS` with `CONSTRAINT uq_cg_liq UNIQUE (timestamp, symbol)`). There is no hourly CoinGlass collector yet — we only backfill and backtest until edge is confirmed.
+
+`coinglass_oi` and `coinglass_funding` are created by `scripts/backfill_coinglass_oi.py` (inline `CREATE TABLE IF NOT EXISTS` with `CONSTRAINT uq_cg_oi` / `uq_cg_fr` on `(timestamp, symbol)`). Same policy: backfill-only, no hourly collector until edge is confirmed via a combo-signal backtest that joins `coinglass_liquidations ⋈ coinglass_oi ⋈ coinglass_funding` on `(timestamp, symbol)`.
 
 ## Running Locally
 
@@ -107,6 +115,12 @@ cp .env.example .env
 # One-shot CoinGlass liquidation backfill (180 days, 4H interval).
 # Requires LIQ_COINGLASS_API_KEY in .env. Idempotent.
 .venv/bin/python scripts/backfill_coinglass.py --days 180
+
+# One-shot CoinGlass OI + funding backfill (180 days; OI at h4, funding at h8→h4).
+# Creates coinglass_oi + coinglass_funding if missing. Idempotent.
+# First BTC record of each endpoint is dumped as raw JSON so field names are
+# inspectable without --verbose. Flags: --coin BTC, --skip-oi, --skip-funding.
+.venv/bin/python scripts/backfill_coinglass_oi.py --days 180
 
 # Backtest H1/H2/H3: liquidation flush → reversal.
 # Reads coinglass_liquidations + fetches Binance 4H klines via ccxt on-the-fly.
@@ -171,7 +185,7 @@ sudo systemctl restart liq-hl-websocket
 All prefixed with `LIQ_`:
 - `LIQ_DB_HOST`, `LIQ_DB_PORT`, `LIQ_DB_NAME`, `LIQ_DB_USER`, `LIQ_DB_PASSWORD`
 - `LIQ_TELEGRAM_BOT_TOKEN`, `LIQ_TELEGRAM_CHAT_ID`
-- `LIQ_COINGLASS_API_KEY` — CoinGlass Hobbyist-tier API key (required for `backfill_coinglass.py`)
+- `LIQ_COINGLASS_API_KEY` — CoinGlass Hobbyist-tier API key (required for `backfill_coinglass.py` and `backfill_coinglass_oi.py`)
 
 ## Constraints
 
@@ -189,3 +203,17 @@ Three new scripts added, reusing `load_liquidations` / `fetch_klines_4h` / `comp
 - **`scripts/analyze_heatmap_signal.py`** — framework for HL heatmap overlay. Cluster rule = top-decile per snapshot (rank rows by `short_liq_usd` / `long_liq_usd`, keep top 10%). HL match = `snapshot_time <= flush_ts ORDER BY DESC LIMIT 1` with max staleness 30 min (no look-ahead). Coin scope = same 6 altcoins. If `n_matched < 30`, prints projected ready date based on match rate; re-run after that date.
 
 HL heatmap data collection started ~2026-04-13, so the overlay script will usually emit "insufficient data" for the first few weeks. Walk-forward and ATR backtest require only `coinglass_liquidations` + on-the-fly Binance klines.
+
+## Session L3b-1 — CoinGlass OI + Funding Backfill
+
+Motivation: Binance hourly `binance_oi` / `binance_funding` hold only ~21 days, too short for a combo-signal backtest. CoinGlass aggregated OI/funding extends the OI + funding series to the same ~167-day horizon we already have for `coinglass_liquidations`, joinable on `(timestamp, symbol)`.
+
+New script `scripts/backfill_coinglass_oi.py` (modeled on `backfill_coinglass.py`):
+
+- **Endpoints**: OI → `/api/futures/open-interest/aggregated-history?interval=h4`; Funding → `/api/futures/funding-rate/oi-weight-ohlc-history` tried first, falling back to `/funding-rate/aggregated-history`; interval `h8` preferred (matches Binance's 8h funding cadence), falling back to `h4`. First non-empty `(path, interval)` combo wins per coin; the chosen combo is logged and printed in the final summary.
+- **Tables**: `coinglass_oi (timestamp, symbol, open_interest, oi_high, oi_low)` and `coinglass_funding (timestamp, symbol, funding_rate)`, both with `UNIQUE (timestamp, symbol)` for idempotency. Created inline via `ensure_tables()` — same policy as `coinglass_liquidations`, not added to `collectors/db.py:SCHEMA_SQL`.
+- **Hobbyist pattern**: single request per `(coin, endpoint)` with `startTime`/`endTime` passed defensively but filtered client-side — API ignores them and returns ≤1000 buckets. 2.5s sleep between requests; full run is ~60 requests ≈ 3 min including funding combo probes.
+- **Field-name safety**: the first record of each endpoint is always dumped as pretty JSON (via `_probe_dump`) so real field names are visible without `--verbose`. Parsers (`build_oi_rows`, `build_funding_rows`) use a `_pick_float` helper with multi-key fallbacks covering common variants (`close`/`c`/`openInterest`/`aggregated_open_interest_usd` for OI close; `close`/`c`/`fundingRate`/`rate` for funding). If all fallbacks miss, inserts write `0` — easy to spot in the summary and patch.
+- **Flags**: `--days` (1–365, default 180), `--coin <BTC>` (single-coin probe), `--verbose`, `--skip-oi`, `--skip-funding`. PEPE falls back to `1000PEPE` automatically, same as the liquidations backfill.
+
+Run on VPS with `.venv/bin/python scripts/backfill_coinglass_oi.py --days 180` and inspect the raw-JSON probe + summary on first run. If the OI or funding-rate column is stuck at 0 in the summary, the fallback key list in `build_oi_rows` / `build_funding_rows` needs the real field name appended; rerun is idempotent. Actual row counts + the `(path, interval)` combo that won for funding should be noted here after the first successful run.
