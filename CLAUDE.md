@@ -17,6 +17,7 @@ liquidation-bot/
 │   ├── init_db.py          — Create database and tables
 │   ├── seed_addresses.py   — Seed whale addresses from leaderboard
 │   ├── test_collectors.py  — Integration test for all endpoints
+│   ├── backfill_binance.py — Backfill last 30 days of Binance history (one-shot)
 │   └── quick_analysis.py   — Data analysis (run after 2+ days)
 ├── systemd/                — Service and timer files for VPS
 └── analysis/               — Generated reports (gitignored)
@@ -65,6 +66,8 @@ BTC, ETH, SOL, DOGE, LINK, AVAX, SUI, ARB, WIF, PEPE
 
 `is_liq_estimated` in `hl_position_snapshots`: `FALSE` = liquidation price from API, `TRUE` = estimated via `entry_px * (1 ± 1/leverage)`. Filter with `WHERE NOT is_liq_estimated` for analysis requiring precise data.
 
+The four `binance_*` tables gain a `UNIQUE(timestamp, symbol)` constraint the first time `scripts/backfill_binance.py` runs (added lazily via `ALTER TABLE ... ADD CONSTRAINT`). This makes backfill + hourly collector coexist safely through `ON CONFLICT DO NOTHING`.
+
 ## Running Locally
 
 ```bash
@@ -80,6 +83,10 @@ cp .env.example .env
 # Manual collection run
 .venv/bin/python -m collectors.hl_snapshots
 .venv/bin/python -m collectors.binance_collector
+
+# One-shot historical backfill (last 30 days of Binance futures data)
+# Idempotent: safe to rerun and to run alongside the hourly collector.
+.venv/bin/python scripts/backfill_binance.py --days 30
 ```
 
 ## VPS Deployment
