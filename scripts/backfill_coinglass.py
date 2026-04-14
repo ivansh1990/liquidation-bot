@@ -40,6 +40,10 @@ CG_FALLBACKS: dict[str, str] = {"PEPE": "1000PEPE"}
 
 REQUEST_SLEEP_S = 2.5  # 30 req/min rate limit
 
+# CoinGlass v4 requires an explicit exchange_list for aggregated endpoints.
+# This captures ~all major perp-futures liquidation venues.
+CG_EXCHANGES = "Binance,OKX,Bybit,Bitget,dYdX,Huobi,Gate,Bitmex,CoinEx,Kraken"
+
 
 async def fetch_liquidations(
     session: aiohttp.ClientSession,
@@ -58,6 +62,7 @@ async def fetch_liquidations(
         params = {
             "symbol": symbol_cg,
             "interval": "h4",
+            "exchange_list": CG_EXCHANGES,
             "startTime": current_start,
             "endTime": end_ts,
         }
