@@ -14,11 +14,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import os
+import ssl
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
+
+# Force unbuffered stdout so progress lines appear in real time on VPS.
+print = functools.partial(print, flush=True)  # noqa: A001
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -51,14 +57,17 @@ async def fetch_liquidations(
     symbol_cg: str,
     start_ts: int,
     end_ts: int,
+    verbose: bool = False,
 ) -> list[dict]:
     """Fetch aggregated liquidation history (4H) for a symbol, paginated."""
     url = f"{CG_BASE}/aggregated-history"
     headers = {"CG-API-KEY": api_key}
     all_records: list[dict] = []
     current_start = start_ts
+    page = 0
 
     while current_start < end_ts:
+        page += 1
         params = {
             "symbol": symbol_cg,
             "interval": "h4",
@@ -66,11 +75,29 @@ async def fetch_liquidations(
             "startTime": current_start,
             "endTime": end_ts,
         }
-        async with session.get(
-            url, headers=headers, params=params,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
-            data = await resp.json()
+        t0 = time.monotonic()
+        if verbose:
+            print(
+                f"    → GET page {page}  startTime={current_start}  "
+                f"({datetime.fromtimestamp(current_start, tz=timezone.utc).date()})"
+            )
+        try:
+            async with session.get(
+                url, headers=headers, params=params,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                status = resp.status
+                data = await resp.json()
+        except asyncio.TimeoutError:
+            print(f"    ❌ Timeout on {symbol_cg} page {page}")
+            break
+        except Exception as e:
+            print(f"    ❌ HTTP error on {symbol_cg} page {page}: {e}")
+            break
+
+        elapsed = time.monotonic() - t0
+        if verbose:
+            print(f"    ← HTTP {status} in {elapsed:.1f}s, code={data.get('code')}")
 
         if data.get("code") != "0" or not data.get("data"):
             print(f"  Warning: {data.get('msg', 'empty')} for {symbol_cg}")
@@ -78,6 +105,8 @@ async def fetch_liquidations(
 
         records = data["data"]
         all_records.extend(records)
+        if verbose:
+            print(f"    page {page}: +{len(records)} records (total {len(all_records)})")
 
         # CoinGlass v4 aggregated-history returns up to 1000 records per call.
         if len(records) < 1000:
@@ -119,6 +148,14 @@ async def main() -> None:
         description="Backfill CoinGlass aggregated liquidation history."
     )
     parser.add_argument("--days", type=int, default=180)
+    parser.add_argument(
+        "--coin", type=str, default=None,
+        help="Limit to a single canonical coin (e.g. BTC). Default: all 10.",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Print per-request progress (URL, status, timing).",
+    )
     args = parser.parse_args()
 
     if args.days < 1 or args.days > 365:
@@ -132,31 +169,57 @@ async def main() -> None:
         print("ERROR: LIQ_COINGLASS_API_KEY not set in .env")
         return
 
+    # Pre-flight DB check so we see problems immediately instead of after 10
+    # slow HTTP calls.
     ensure_table()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM coinglass_liquidations")
+            before = cur.fetchone()[0]
+    print(f"DB: {before} rows in coinglass_liquidations before backfill")
 
     end_ts = int(datetime.now(timezone.utc).timestamp())
     start_ts = int(
         (datetime.now(timezone.utc) - timedelta(days=args.days)).timestamp()
     )
 
+    coins = (
+        [(args.coin, CG_SYMBOLS[args.coin])] if args.coin
+        else list(CG_SYMBOLS.items())
+    )
+    if args.coin and args.coin not in CG_SYMBOLS:
+        parser.error(f"--coin must be one of: {list(CG_SYMBOLS)}")
+
     print(
         f"Backfilling {args.days} days: "
         f"{datetime.fromtimestamp(start_ts, tz=timezone.utc).date()} → "
-        f"{datetime.fromtimestamp(end_ts, tz=timezone.utc).date()}"
+        f"{datetime.fromtimestamp(end_ts, tz=timezone.utc).date()}  "
+        f"({len(coins)} coin{'s' if len(coins) != 1 else ''})"
     )
 
-    async with aiohttp.ClientSession() as session:
-        for coin, primary_sym in CG_SYMBOLS.items():
+    # Use certifi for SSL trust store to avoid LibreSSL/certstore surprises.
+    try:
+        import certifi
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ssl_ctx = ssl.create_default_context()
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        for coin, primary_sym in coins:
+            t_coin = time.monotonic()
             print(f"[{coin}] Fetching from CoinGlass (symbol={primary_sym})...")
             records = await fetch_liquidations(
-                session, api_key, primary_sym, start_ts, end_ts
+                session, api_key, primary_sym, start_ts, end_ts,
+                verbose=args.verbose,
             )
 
             if not records and coin in CG_FALLBACKS:
                 fallback_sym = CG_FALLBACKS[coin]
                 print(f"  No data for {primary_sym}, trying fallback {fallback_sym}...")
                 records = await fetch_liquidations(
-                    session, api_key, fallback_sym, start_ts, end_ts
+                    session, api_key, fallback_sym, start_ts, end_ts,
+                    verbose=args.verbose,
                 )
 
             if not records:
@@ -186,22 +249,40 @@ async def main() -> None:
                 ))
 
             from psycopg2.extras import execute_values
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    execute_values(
-                        cur,
-                        """
-                        INSERT INTO coinglass_liquidations
-                            (timestamp, symbol, long_vol_usd, short_vol_usd,
-                             long_count, short_count)
-                        VALUES %s
-                        ON CONFLICT (timestamp, symbol) DO NOTHING
-                        """,
-                        rows,
-                        page_size=500,
-                    )
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT COUNT(*) FROM coinglass_liquidations WHERE symbol=%s",
+                            (coin,),
+                        )
+                        n_before = cur.fetchone()[0]
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO coinglass_liquidations
+                                (timestamp, symbol, long_vol_usd, short_vol_usd,
+                                 long_count, short_count)
+                            VALUES %s
+                            ON CONFLICT (timestamp, symbol) DO NOTHING
+                            """,
+                            rows,
+                            page_size=500,
+                        )
+                        cur.execute(
+                            "SELECT COUNT(*) FROM coinglass_liquidations WHERE symbol=%s",
+                            (coin,),
+                        )
+                        n_after = cur.fetchone()[0]
+            except Exception as e:
+                print(f"  ❌ DB insert failed for {coin}: {e}")
+                continue
 
-            print(f"  ✅ {coin}: {len(rows)} records")
+            print(
+                f"  ✅ {coin}: fetched {len(rows)} rows, "
+                f"inserted {n_after - n_before} new (was {n_before}, now {n_after}) "
+                f"in {time.monotonic() - t_coin:.1f}s"
+            )
             await asyncio.sleep(REQUEST_SLEEP_S)
 
     # Summary
@@ -215,10 +296,13 @@ async def main() -> None:
                 GROUP BY symbol ORDER BY symbol
                 """
             )
-            print("\nSummary:")
-            print(f"  {'Symbol':<8} {'Rows':>6}  {'From':>12}  {'To':>12}")
-            for row in cur.fetchall():
-                print(f"  {row[0]:<8} {row[1]:>6}  {row[2]}  {row[3]}")
+            rows = cur.fetchall()
+    print("\nSummary:")
+    print(f"  {'Symbol':<8} {'Rows':>6}  {'From':>12}  {'To':>12}")
+    for row in rows:
+        print(f"  {row[0]:<8} {row[1]:>6}  {row[2]}  {row[3]}")
+    if not rows:
+        print("  (table is empty)")
 
 
 if __name__ == "__main__":
