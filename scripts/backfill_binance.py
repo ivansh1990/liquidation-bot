@@ -56,30 +56,47 @@ COIN_SLEEP_S = 0.5
 
 
 # ---------------------------------------------------------------------------
-# Schema: add UNIQUE constraints (idempotent)
+# Schema: dedupe existing rows, then add UNIQUE constraints (idempotent)
 # ---------------------------------------------------------------------------
+#
+# The hourly collector inserts a fresh row every run; for binance_funding the
+# fundingTimestamp from Binance advances only every 8 hours, so repeated runs
+# produce duplicate (timestamp, symbol) pairs. We delete the extras (keeping
+# the lowest `id` = oldest) before adding the UNIQUE constraint.
 
-UNIQUE_CONSTRAINTS_SQL = """
-DO $$ BEGIN
-    ALTER TABLE binance_oi       ADD CONSTRAINT uq_boi UNIQUE (timestamp, symbol);
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN
-    ALTER TABLE binance_funding  ADD CONSTRAINT uq_bfr UNIQUE (timestamp, symbol);
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN
-    ALTER TABLE binance_ls_ratio ADD CONSTRAINT uq_bls UNIQUE (timestamp, symbol);
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN
-    ALTER TABLE binance_taker    ADD CONSTRAINT uq_btk UNIQUE (timestamp, symbol);
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-"""
+_BINANCE_TABLES = (
+    ("binance_oi", "uq_boi"),
+    ("binance_funding", "uq_bfr"),
+    ("binance_ls_ratio", "uq_bls"),
+    ("binance_taker", "uq_btk"),
+)
 
 
 def ensure_unique_constraints() -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(UNIQUE_CONSTRAINTS_SQL)
-    log.info("UNIQUE(timestamp, symbol) constraints ensured on all 4 tables")
+            total_deleted = 0
+            for tbl, _ in _BINANCE_TABLES:
+                cur.execute(
+                    f"DELETE FROM {tbl} a USING {tbl} b "
+                    f"WHERE a.id > b.id "
+                    f"AND a.timestamp = b.timestamp "
+                    f"AND a.symbol = b.symbol"
+                )
+                if cur.rowcount:
+                    log.info("Deduped %s: removed %d duplicate row(s)", tbl, cur.rowcount)
+                    total_deleted += cur.rowcount
+            for tbl, cname in _BINANCE_TABLES:
+                cur.execute(
+                    f"DO $$ BEGIN "
+                    f"ALTER TABLE {tbl} ADD CONSTRAINT {cname} UNIQUE (timestamp, symbol); "
+                    f"EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+                )
+    log.info(
+        "UNIQUE(timestamp, symbol) constraints ensured on all 4 tables "
+        "(%d duplicate rows removed)",
+        total_deleted,
+    )
 
 
 # ---------------------------------------------------------------------------

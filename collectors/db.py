@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS binance_oi (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol TEXT NOT NULL,
     open_interest DOUBLE PRECISION,
-    open_interest_usd DOUBLE PRECISION
+    open_interest_usd DOUBLE PRECISION,
+    CONSTRAINT uq_boi UNIQUE (timestamp, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_boi_sym_ts ON binance_oi(symbol, timestamp);
 
@@ -77,7 +78,8 @@ CREATE TABLE IF NOT EXISTS binance_funding (
     timestamp TIMESTAMPTZ NOT NULL,
     symbol TEXT NOT NULL,
     funding_rate DOUBLE PRECISION,
-    mark_price DOUBLE PRECISION
+    mark_price DOUBLE PRECISION,
+    CONSTRAINT uq_bfr UNIQUE (timestamp, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_bfr_sym_ts ON binance_funding(symbol, timestamp);
 
@@ -88,7 +90,8 @@ CREATE TABLE IF NOT EXISTS binance_ls_ratio (
     symbol TEXT NOT NULL,
     long_account_pct DOUBLE PRECISION,
     short_account_pct DOUBLE PRECISION,
-    long_short_ratio DOUBLE PRECISION
+    long_short_ratio DOUBLE PRECISION,
+    CONSTRAINT uq_bls UNIQUE (timestamp, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_bls_sym_ts ON binance_ls_ratio(symbol, timestamp);
 
@@ -99,7 +102,8 @@ CREATE TABLE IF NOT EXISTS binance_taker (
     symbol TEXT NOT NULL,
     buy_vol DOUBLE PRECISION,
     sell_vol DOUBLE PRECISION,
-    buy_sell_ratio DOUBLE PRECISION
+    buy_sell_ratio DOUBLE PRECISION,
+    CONSTRAINT uq_btk UNIQUE (timestamp, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_btk_sym_ts ON binance_taker(symbol, timestamp);
 """
@@ -270,6 +274,7 @@ def insert_binance_oi(conn, symbol: str, ts, oi: float, oi_usd: float) -> None:
         """
         INSERT INTO binance_oi (timestamp, symbol, open_interest, open_interest_usd)
         VALUES (%s, %s, %s, %s)
+        ON CONFLICT (timestamp, symbol) DO NOTHING
         """,
         (ts, symbol, oi, oi_usd),
     )
@@ -282,6 +287,7 @@ def insert_binance_funding(
         """
         INSERT INTO binance_funding (timestamp, symbol, funding_rate, mark_price)
         VALUES (%s, %s, %s, %s)
+        ON CONFLICT (timestamp, symbol) DO NOTHING
         """,
         (ts, symbol, funding_rate, mark_price),
     )
@@ -300,6 +306,7 @@ def insert_binance_ls_ratio(
         INSERT INTO binance_ls_ratio
             (timestamp, symbol, long_account_pct, short_account_pct, long_short_ratio)
         VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (timestamp, symbol) DO NOTHING
         """,
         (ts, symbol, long_pct, short_pct, ratio),
     )
@@ -318,6 +325,7 @@ def insert_binance_taker(
         INSERT INTO binance_taker
             (timestamp, symbol, buy_vol, sell_vol, buy_sell_ratio)
         VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (timestamp, symbol) DO NOTHING
         """,
         (ts, symbol, buy_vol, sell_vol, ratio),
     )
