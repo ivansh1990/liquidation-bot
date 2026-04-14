@@ -43,10 +43,12 @@ from collectors.db import get_conn, init_pool
 CG_BASE = "https://open-api-v4.coinglass.com/api/futures"
 OI_PATH = "/open-interest/aggregated-history"
 # Funding rate endpoints — try in order until one returns non-empty data.
-# Naming across docs is inconsistent; oi-weight-ohlc is the common aggregated form.
+# Per CoinGlass v4 docs (2026-04), the aggregated forms are oi-weight-history
+# and vol-weight-history (no `-ohlc-` infix). `aggregated-history` exists for
+# liquidations + OI but NOT for funding.
 FUNDING_PATHS = (
-    "/funding-rate/oi-weight-ohlc-history",
-    "/funding-rate/aggregated-history",
+    "/funding-rate/oi-weight-history",
+    "/funding-rate/vol-weight-history",
 )
 # Funding is naturally 8-hour-cadence on Binance; try h8 first. Fall back to
 # h4 (potentially interpolated) if h8 isn't accepted for this symbol.
