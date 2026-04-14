@@ -19,7 +19,10 @@ liquidation-bot/
 │   ├── test_collectors.py  — Integration test for all endpoints
 │   ├── backfill_binance.py — Backfill last 30 days of Binance history (one-shot)
 │   ├── backfill_coinglass.py — Backfill 180 days of CoinGlass aggregated liquidations (one-shot)
-│   ├── backtest_liquidation_flush.py — H1/H2/H3 backtest: liquidation asymmetry → reversal
+│   ├── backtest_liquidation_flush.py — H1/H2/H3 backtest: liquidation asymmetry → reversal (L2 baseline, locked)
+│   ├── walkforward_h1_flush.py — L3: 6-fold expanding-window walk-forward validation of H1
+│   ├── backtest_h1_with_stops.py — L3: ATR-based TP/SL grid (64 configs/coin) using H1 entries
+│   ├── analyze_heatmap_signal.py — L3: HL heatmap overlay framework (top-decile clusters, preceding-snapshot match)
 │   └── quick_analysis.py   — Data analysis (run after 2+ days)
 ├── systemd/                — Service and timer files for VPS
 └── analysis/               — Generated reports (gitignored)
@@ -108,6 +111,21 @@ cp .env.example .env
 # Backtest H1/H2/H3: liquidation flush → reversal.
 # Reads coinglass_liquidations + fetches Binance 4H klines via ccxt on-the-fly.
 .venv/bin/python scripts/backtest_liquidation_flush.py
+
+# L3: walk-forward validation of H1 long-flush signal.
+# 6 folds, expanding window, altcoins only (SOL/DOGE/LINK/AVAX/SUI/ARB).
+# Prints per-coin fold table + portfolio PASS/FAIL summary.
+.venv/bin/python scripts/walkforward_h1_flush.py
+
+# L3: ATR-based TP/SL backtest using H1 entries.
+# Grid = 4 TP×ATR × 4 SL×ATR × 4 max_hold = 64 configs/coin.
+# Entry z-thresholds hardcoded in DEFAULT_THRESHOLDS (update after walk-forward).
+.venv/bin/python scripts/backtest_h1_with_stops.py
+
+# L3: HL heatmap overlay analysis (framework).
+# Matches H1 flush events to the immediately-preceding hl_liquidation_map snapshot.
+# With ~1 day of HL data, usually prints "insufficient, projected ready date: ...".
+.venv/bin/python scripts/analyze_heatmap_signal.py
 ```
 
 ## VPS Deployment
@@ -161,3 +179,13 @@ All prefixed with `LIQ_`:
 - All Hyperliquid and Binance endpoints are public (no API key needed); CoinGlass requires a free Hobbyist-tier key
 - No Docker
 - No trading/strategy logic — data collection + offline backtesting only
+
+## Session L3 — Walk-forward + ATR stops + heatmap overlay
+
+Three new scripts added, reusing `load_liquidations` / `fetch_klines_4h` / `compute_signals` / `backtest_signal` from `scripts/backtest_liquidation_flush.py` (L2 baseline — do not modify).
+
+- **`scripts/walkforward_h1_flush.py`** — 6 folds (fold 0 = train-only, folds 1–5 = OOS), expanding-window. Grid = z ∈ {1.0,1.5,2.0,2.5,3.0} × h ∈ {4,8,12} with min train N=5; falls back to `(z=2.0, h=8)` (L2 consensus) when no combo qualifies. Pooled OOS Sharpe is computed on concatenated trade returns across folds. PASS per coin = ≥4/5 positive folds AND pooled Sharpe>0.5 AND pooled win%>55. Coins: SOL, DOGE, LINK, AVAX, SUI, ARB (BTC/ETH skipped — no L2 edge).
+- **`scripts/backtest_h1_with_stops.py`** — ATR(14, shifted +1 bar) TP/SL simulator. Grid = TP×ATR ∈ {1.0,1.5,2.0,2.5} × SL×ATR ∈ {0.5,0.75,1.0,1.5} × max_hold ∈ {2,3,4,6} bars (= 8h/12h/16h/24h) → 64 configs/coin. Entry thresholds in `DEFAULT_THRESHOLDS` dict at top of file — update by hand after walk-forward confirms winners. Same-bar TP+SL = pessimistic (SL first). Gap-through-SL: if `bar.open <= sl`, fill at `bar.open` (worse than sl); tracked as `SL_gap` separately from clean `SL` in the exit-reason breakdown. Gap-through-TP handled symmetrically. Adds a new OHLC fetcher `fetch_klines_4h_ohlc` local to this script (L2's `fetch_klines_4h` returns close only).
+- **`scripts/analyze_heatmap_signal.py`** — framework for HL heatmap overlay. Cluster rule = top-decile per snapshot (rank rows by `short_liq_usd` / `long_liq_usd`, keep top 10%). HL match = `snapshot_time <= flush_ts ORDER BY DESC LIMIT 1` with max staleness 30 min (no look-ahead). Coin scope = same 6 altcoins. If `n_matched < 30`, prints projected ready date based on match rate; re-run after that date.
+
+HL heatmap data collection started ~2026-04-13, so the overlay script will usually emit "insufficient data" for the first few weeks. Walk-forward and ATR backtest require only `coinglass_liquidations` + on-the-fly Binance klines.
