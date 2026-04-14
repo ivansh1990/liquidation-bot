@@ -7,3 +7,5 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 analysis/report_*.txt
+state/paper_state.json
+state/paper_state.json.tmp

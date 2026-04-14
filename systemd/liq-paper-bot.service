@@ -1,0 +1,19 @@
+[Unit]
+Description=Liquidation Bot - Paper Trading (market_flush)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ivan
+WorkingDirectory=/home/ivan/liquidation-bot
+ExecStart=/home/ivan/liquidation-bot/.venv/bin/python -m bot.scheduler
+Restart=always
+RestartSec=30
+EnvironmentFile=/home/ivan/liquidation-bot/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=liq-paper-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -13,10 +13,17 @@ liquidation-bot/
 │   ├── hl_snapshots.py     — Hyperliquid: position snapshots → liquidation map
 │   ├── binance_collector.py — Binance: OI, funding, L/S ratio, taker
 │   └── alerts.py           — Telegram notifications
+├── bot/
+│   ├── config.py           — BotConfig (subclasses collectors.config.Config)
+│   ├── signal.py           — SignalComputer: live market_flush signal (L3b-2, locked)
+│   ├── paper_executor.py   — PaperExecutor: simulates LONG positions, state JSON
+│   ├── alerts.py           — Telegram message formatters (wraps collectors/alerts)
+│   └── scheduler.py        — Main 4H-aligned loop (python -m bot.scheduler)
 ├── scripts/
 │   ├── init_db.py          — Create database and tables
 │   ├── seed_addresses.py   — Seed whale addresses from leaderboard
 │   ├── test_collectors.py  — Integration test for all endpoints
+│   ├── test_paper_bot.py   — L4: offline tests for bot/ (z-score parity, state, signal)
 │   ├── backfill_binance.py — Backfill last 30 days of Binance history (one-shot)
 │   ├── backfill_coinglass.py — Backfill 180 days of CoinGlass aggregated liquidations (one-shot)
 │   ├── backfill_coinglass_oi.py — Backfill 180 days of CoinGlass aggregated OI + funding (one-shot)
@@ -26,6 +33,7 @@ liquidation-bot/
 │   ├── analyze_heatmap_signal.py — L3: HL heatmap overlay framework (top-decile clusters, preceding-snapshot match)
 │   ├── backtest_combo.py   — L3b-2: combo signal backtest (9 combos × 10 coins × 4 holding periods, portfolio + walk-forward)
 │   └── quick_analysis.py   — Data analysis (run after 2+ days)
+├── state/                  — Paper-bot state (paper_state.json, gitignored)
 ├── systemd/                — Service and timer files for VPS
 └── analysis/               — Generated reports (gitignored)
 ```
@@ -261,3 +269,77 @@ New script `scripts/backtest_combo.py` — reuses L2/L3 helpers, writes no new D
 - **Interpretation rubric (per spec)**: EDGE if any combo has pooled Sharpe>2.0 AND Win%>60 AND N>30 AND walk-forward ≥2/3 OOS positive. NO EDGE if all combos hover at 50% win rate, or N<10 per coin, or edge only on 1 coin.
 
 Run: `.venv/bin/python scripts/backtest_combo.py | tee analysis/combo_L3b.txt`. Requires `coinglass_oi` and `coinglass_funding` populated (L3b-1). No new DB writes — pure offline analysis.
+
+## Session L4 — Paper Trading Bot (market_flush)
+
+First live signal deployment. L3b-2's `market_flush` combo (422 trades / 60.7% win / Sharpe 5.60 / 3/3 OOS folds positive) moved off the backtest into a real-time loop that fires every 4H, simulates LONG entries, and tracks equity in a JSON state file. No real money — paper only, minimum 2 weeks before considering live.
+
+New `bot/` package (5 modules, all reuse collectors infrastructure):
+
+- **`bot/config.py`** — `BotConfig(Config)` subclasses `collectors.config.Config`, inheriting DB/Telegram/CoinGlass env vars and the `LIQ_` prefix for free. Adds bot-specific fields with hardcoded defaults (signal thresholds locked from L3b-2: `z_threshold_self=1.0`, `z_threshold_market=1.5`, `min_coins_flushing=4`, `z_lookback=90`, `holding_hours=8`; risk: `max_loss_pct=5.0` (unleveraged price), `max_positions=5`; paper: `initial_capital=1000.0`, `position_size_pct=10.0`, `leverage=3.0`). `get_bot_config()` is `@lru_cache`'d and returns `BotConfig`.
+- **`bot/signal.py`** — `SignalComputer`:
+  - `fetch_recent_liquidations(session, coin, n_bars=100)` → hits `https://open-api-v4.coinglass.com/api/futures/liquidation/aggregated-history?interval=h4` with the same `CG-API-KEY` header, `exchange_list` param, and PEPE→1000PEPE fallback as `scripts/backfill_coinglass.py`. Parses `aggregated_long_liquidation_usd` / `aggregated_short_liquidation_usd` (with `longVolUsd`/`shortVolUsd` fallbacks for older response shapes). Side-effects rows into `coinglass_liquidations` via `execute_values INSERT ... ON CONFLICT DO NOTHING` so the table stays fresh between backfills.
+  - `compute_z_scores(df)` — mirrors `scripts/backtest_liquidation_flush.py:116-119` byte-for-byte (default `.rolling(90).std()` ddof, no `min_periods` override). Any drift here will invalidate the L3b-2 backtest parity.
+  - `check_market_flush(session)` — fetches all 10 coins serially with a 2.5 s sleep between requests (respects CoinGlass 30-req/min Hobbyist limit). Applies a **strict freshness gate**: the last bar's timestamp must equal `floor_4h(now) − 4h` (the most-recent fully-closed 4H bucket); any stale coin flips `fetch_failed=True` and the scheduler skips entries for that cycle. NaN z-scores are coerced to 0.0 only at `iloc[-1]` (never mutates the full series). Returns `{is_market_flush, fetch_failed, n_coins_flushing, entry_coins, all_z_scores, timestamp}`.
+- **`bot/paper_executor.py`** — `PaperExecutor`:
+  - **State schema** (UTC ISO-8601 throughout): `{capital, positions[], closed_trades[], equity_history[], last_summary_date}`. Position rows carry `margin_usd` and `notional_usd` **explicitly** (not inferred) so the formula stays auditable. `last_summary_date` guards against double-sending the daily summary across restarts.
+  - **Atomic save**: writes to `state/paper_state.json.tmp` then `os.replace()` — survives SIGKILL mid-write. `.gitignore` excludes both `paper_state.json` and its `.tmp` sibling.
+  - **Entry price**: live ccxt Binance futures ticker (`fetch_ticker(binance_ccxt_symbol(coin))["last"]`) at decision time (per user choice — NOT the 4H bar close). Accept ~5 min drift vs the backtest in exchange for realistic paper→live transition behavior.
+  - **Exit**: **time-based**, not bar-countdown. `exit_due = entry_time + timedelta(hours=8)` stored at open; `check_positions()` closes when `now >= exit_due` (reason `"timeout"`). Time-based survives systemd restarts / skipped cycles; countdown does not.
+  - **Catastrophe SL**: `pnl_pct_price <= -max_loss_pct` (unleveraged price drop) → reason `"sl_hit"`. A −5% price move at 3× lev = −15% margin; matches the backtest `max_loss` column semantically.
+  - **P&L formula (do not change without coordinating with backtest)**:  `pnl_pct = (exit − entry) / entry * 100` (unleveraged price move, directly comparable to backtest `return_8h`);  `pnl_usd = pnl_pct / 100 * notional_usd` (leverage applied to dollars only). Capital updates only on close — margin is not debited on open in the paper model.
+  - `get_summary()` returns equity, total/daily trade counts, win rate, open-position count.
+- **`bot/scheduler.py`** — `async main()` runs an infinite loop aligned to the 4H UTC grid + 5 min buffer (00:05, 04:05, 08:05, ...). Each cycle:
+  1. `check_positions()` — runs FIRST so exits happen even when CoinGlass is down.
+  2. `check_market_flush()` — signal eval.
+  3. If `fetch_failed` → log + skip entries. If `is_market_flush` → open up to `max_positions − open_count` positions, highest-z first, deduping against already-held coins (checks both `state.positions` and this cycle's newly-opened list).
+  4. Daily summary at the first cycle of each UTC day (`now.hour < 4` and `last_summary_date != today`).
+  5. Atomic save, then `next_wake_ts()` recomputes wake target from wall clock each iteration (no accumulated sleep drift).
+  - Unhandled exceptions in `run_cycle` are logged + Telegram-alerted, then the loop continues to the next wake. Telegram failures inside the error handler are swallowed so alerts can never kill the loop.
+- **`bot/alerts.py`** — thin wrappers over `collectors.alerts.send_alert(cfg, msg)` (reused, not re-implemented). Five HTML-formatted message builders: `notify_startup`, `notify_market_flush`, `notify_opened`, `notify_closed`, `notify_daily_summary`, plus `notify_error` for the main-loop exception path.
+
+**`scripts/test_paper_bot.py`** — offline integration test, standalone (no pytest dependency, matches `scripts/test_collectors.py` pattern):
+1. **Z-score parity** — synthesizes a 120-row `long_vol_usd` DF, runs `SignalComputer.compute_z_scores`, and compares element-wise via `pd.testing.assert_series_equal` against the inline L2 formula. Guards against accidental drift in the rolling-window parameters.
+2. **State round-trip** — `PaperExecutor` pointed at a `tempfile.TemporaryDirectory`, patches `get_current_price` via `unittest.mock.patch.object(..., autospec=True)` to avoid live ccxt, opens 2 positions → saves → reloads → closes one via forced `exit_due` in the past (verifies `"timeout"` reason and exact P&L) → triggers the catastrophe SL on the other via a −6% mock price move (verifies `"sl_hit"` reason).
+3. **Signal end-to-end** — monkeypatches `SignalComputer.fetch_recent_liquidations` to return canned DFs whose last bar is aligned to `floor_4h(now) − 4h` and whose z-scores are crafted per coin (4 coins at z≈2.0, 1 at z≈1.2, 5 at z≈0.3). Asserts `n_coins_flushing=4`, `is_market_flush=True`, `entry_coins = {BTC, DOGE, ETH, LINK, SOL}`. A second leg uses a stale index (last bar 4h too old) to verify `fetch_failed=True` gating.
+4. **Optional**: live CoinGlass smoke test (fetches BTC), skipped if `LIQ_COINGLASS_API_KEY` is empty.
+
+All 19 assertions pass locally on 2026-04-14.
+
+Run: `.venv/bin/python scripts/test_paper_bot.py` (exit 0 on all-pass).
+
+**`systemd/liq-paper-bot.service`** — `Type=simple` + `Restart=always` + `RestartSec=30`, `ExecStart=.venv/bin/python -m bot.scheduler`, mirrors `liq-hl-websocket.service`. Not enabled by default — add manually after first VPS deploy:
+
+```bash
+cd ~/liquidation-bot && git pull
+mkdir -p state
+.venv/bin/python scripts/test_paper_bot.py
+sudo cp systemd/liq-paper-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now liq-paper-bot.service
+sudo journalctl -u liq-paper-bot -f
+```
+
+Monitoring cheatsheet:
+
+```bash
+# Equity + trade count
+python3 -c "import json; s=json.load(open('state/paper_state.json')); \
+    print(f'Equity: \${s[\"capital\"]:.2f}, closed: {len(s[\"closed_trades\"])}, open: {len(s[\"positions\"])}')"
+
+# Last 4H CoinGlass row per coin
+psql -d liquidation -c "SELECT symbol, MAX(timestamp) FROM coinglass_liquidations GROUP BY symbol ORDER BY 2 DESC;"
+```
+
+**Things to watch in the first 2 weeks**:
+
+- Paper win-rate at N≥20 trades should sit within ~10 pp of the backtest 60.7%. A sustained <50% over 30+ trades = investigate before extending.
+- The `fetch_failed=True` rate. If CoinGlass's 4H update is routinely >5 min late, the freshness gate will suppress signals — the 5-min buffer in `next_wake_ts()` may need to grow.
+- The `coinglass_liquidations` table now gains fresh rows every 4H as a side effect of the bot running — previously this table only grew during explicit backfills.
+
+**Do NOT**:
+
+- change the signal definition, thresholds, holding period, or coin list (locked to L3b-2).
+- drop the freshness gate or the fail-stop on partial fetches.
+- "improve" P&L to use a leveraged `pnl_pct` (breaks backtest parity).
+- add ATR TP/SL, trailing stops, or live execution — those are separate future sessions.
