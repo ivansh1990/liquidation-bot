@@ -19,11 +19,23 @@ liquidation-bot/
 │   ├── paper_executor.py   — PaperExecutor: simulates LONG positions, state JSON
 │   ├── alerts.py           — Telegram message formatters (wraps collectors/alerts)
 │   └── scheduler.py        — Main 4H-aligned loop (python -m bot.scheduler)
+├── telegram_bot/           — L5: interactive Telegram command interface
+│   ├── app.py              — Entrypoint: `python -m telegram_bot.app`
+│   ├── config.py           — TelegramBotConfig (subclasses BotConfig)
+│   ├── registry.py         — StrategyEntry + REGISTRY (4H live, 2H/1H stubs)
+│   ├── polling.py          — getUpdates long-poll loop + chat_id auth
+│   ├── telegram_api.py     — Raw aiohttp wrappers + escape_md (MarkdownV2)
+│   ├── rate_limit.py       — Per-chat 5s window
+│   ├── pnl.py              — equity_by_day, pnl_today, sharpe_ratio, best_worst
+│   ├── formatters.py       — MarkdownV2 message builders + unicode sparkline
+│   ├── health.py           — systemd + journalctl + HTTP pings + host stats
+│   └── handlers.py         — Per-command business logic (7 commands)
 ├── scripts/
 │   ├── init_db.py          — Create database and tables
 │   ├── seed_addresses.py   — Seed whale addresses from leaderboard
 │   ├── test_collectors.py  — Integration test for all endpoints
 │   ├── test_paper_bot.py   — L4: offline tests for bot/ (z-score parity, state, signal)
+│   ├── test_telegram_bot.py — L5: offline tests for telegram_bot/ (escape, formatters, dispatch)
 │   ├── backfill_binance.py — Backfill last 30 days of Binance history (one-shot)
 │   ├── backfill_coinglass.py — Backfill 180 days of CoinGlass aggregated liquidations (one-shot)
 │   ├── backfill_coinglass_oi.py — Backfill 180 days of CoinGlass aggregated OI + funding (one-shot)
@@ -343,3 +355,77 @@ psql -d liquidation -c "SELECT symbol, MAX(timestamp) FROM coinglass_liquidation
 - drop the freshness gate or the fail-stop on partial fetches.
 - "improve" P&L to use a leveraged `pnl_pct` (breaks backtest parity).
 - add ATR TP/SL, trailing stops, or live execution — those are separate future sessions.
+
+## Session L5 — Telegram Command Bot
+
+Motivation: L4 only emits a daily summary at 00:05 UTC. Between those there is no way to ask "how are we doing?" without SSHing into the VPS. Goal: a second long-running service that polls Telegram for `/status`, `/pnl`, `/trades`, `/positions`, `/config`, `/health`, `/help` and replies with an on-demand view of paper-bot state. Completely independent from `liq-paper-bot` — a crash here cannot kill the trading loop.
+
+New `telegram_bot/` package (11 modules):
+
+- **`telegram_bot/app.py`** — entrypoint (`python -m telegram_bot.app`). `build_dispatcher(cfg, limiter)` returns the `async dispatch(msg)` handler wired to `poll_updates`. For commands in `NEEDS_LOADING` (`/status`, `/pnl`, `/trades`, `/positions`, `/health`) it sends `⏳ Loading…` first, then `editMessageText` with the real reply — trims perceived latency for commands with I/O. Wraps each handler in `asyncio.wait_for(..., timeout=cfg.command_reply_timeout_s=15.0)` and catches all exceptions so a handler bug cannot crash the polling loop. Exception messages are truncated to 300 chars and escaped — no stack traces leak to Telegram.
+- **`telegram_bot/config.py`** — `TelegramBotConfig(BotConfig)` inherits `.env` loading, `telegram_bot_token`, `telegram_chat_id`, and all L3b-2 signal thresholds. Adds `poll_timeout_s=30` (Telegram max long-poll), `poll_client_timeout_s=40` (must > poll_timeout), `command_reply_timeout_s=15.0` (bumped from the original 10s to accommodate `/health`'s 4 parallel pings + systemd subprocess), `position_price_timeout_s=2.0` (per-coin ccxt bound in `/positions`), `rate_limit_window_s=5.0`.
+- **`telegram_bot/registry.py`** — frozen `StrategyEntry` dataclass + module-level `REGISTRY` with 3 entries: `4h` (live, `state_file=state/paper_state.json`, `systemd_unit=liq-paper-bot.service`, `holding_hours=8`), `2h` (stub, all fields `None`), `1h` (stub). `load_executor(entry, cfg)` returns `None` for non-deployed entries or constructs a `PaperExecutor` pointed at `entry.state_file` via `cfg.model_copy(update={...})` so the shared BotConfig stays immutable. `find_entry("4h"|"4H"|"4")` normalizes case + trailing "h". When 2H/1H ship, flip on `state_file` + `systemd_unit` + `holding_hours` — no other code change needed in the telegram bot.
+- **`telegram_bot/telegram_api.py`** — raw `aiohttp` wrappers for `sendMessage` / `editMessageText` / `getUpdates`. No dependency on python-telegram-bot or aiogram. `escape_md(s)` is the single source of truth for MarkdownV2 escaping — covers all 18 specials (``_*[]()~`>#+-=|{}.!`` plus `\`). Static MarkdownV2 syntax (``**bold**``, ` ```code``` `) is composed AROUND the escaped body, never inside.
+- **`telegram_bot/polling.py`** — `async poll_updates(cfg, handler)` maintains `offset = last_update_id + 1` in memory. Filters to `message.text.startswith("/")` AND `str(message.chat.id) == cfg.telegram_chat_id`. Any other chat is silently dropped with a single INFO log line (`ignored update from chat <id> (not authorized)`). Network errors → log + `sleep(poll_error_backoff_s=5)` + retry. The loop only terminates on task cancellation. `_is_authorized(msg, chat_id)` is factored out so `scripts/test_telegram_bot.py` can exercise it directly.
+- **`telegram_bot/rate_limit.py`** — per-chat `dict[chat_id, last_monotonic]`. `check(chat_id) -> (allowed, retry_after_s)`. `allowed=True` records the tick; `allowed=False` does NOT update the tick (so spam doesn't extend the window). Accepts an injectable `clock` callable → deterministic tests.
+- **`telegram_bot/pnl.py`** — pure read-only aggregations over `PaperExecutor.state`:
+  - `pnl_today(closed_trades, initial_capital, now=None)` — sum of `pnl_usd` for trades whose `exit_time.date() == now.date()` UTC. Percent is vs `initial_capital` (stable denominator matching `notify_daily_summary`).
+  - `pnl_total(equity, initial_capital)` — `(equity - initial, pct_of_initial)`.
+  - `equity_by_day(equity_history, initial_capital, days=7, now=None)` — one `(date, end_of_day equity)` per UTC day for the last `days` days. Days with no equity change carry the previous known value forward. Days before the first recorded entry fall back to `initial_capital`.
+  - `sharpe_ratio(closed_trades, holding_hours, min_trades=10)` — annualized Sharpe using sample std (ddof=1) matching pandas default, so the printed number is directly comparable to `scripts/backtest_liquidation_flush.py` and L3b-2 tables. Returns `None` below `min_trades`.
+  - `best_worst_trade` / `win_rate` — trivial.
+- **`telegram_bot/formatters.py`** — 8 pure message builders (`format_status`, `format_pnl`, `format_pnl_not_deployed`, `format_trades`, `format_positions`, `format_config`, `format_health`, `format_help`) plus small utilities (`format_unknown`, `format_usage_trades`, `format_rate_limited`, `format_loading`, `format_error`). Output is MarkdownV2 clamped to 4000 chars (under Telegram's 4096 with trim-marker headroom). Long tables use fenced ``` text ``` blocks so ASCII dividers (`|`, `-`, `.`) inside don't need escaping. `_sparkline(values)` maps a list of floats to `▁▂▃▄▅▆▇█` — unicode block chars are NOT in the MD2 escape list, so they render inline safely (asserted by a test).
+- **`telegram_bot/health.py`** — lazy-tolerant health primitives:
+  - `check_systemd_unit(unit)` — `systemctl is-active` + `systemctl show -p ActiveEnterTimestamp`. Returns `{state: "unknown", uptime: None}` when `systemctl` isn't on PATH (Darwin dev box). Parses both `'Tue 2026-04-14 12:00:00 UTC'` and naked-timestamp formats; elapsed → `"4h 12m"`.
+  - `recent_errors(unit, hours=1)` — best-effort `journalctl -p err --no-pager`. Drops the `-- Logs begin at ...` banner. `[]` on systems without journalctl.
+  - `ping_endpoint(session, spec, timeout=5.0)` — `(name, ok, ms)`. `ping_all()` runs the 4 API endpoints in parallel via `asyncio.gather`.
+  - **Endpoints pinged** (all public, no auth needed): Binance `fapi/v1/ping`, CoinGlass `futures/supported-coins`, Hyperliquid `POST /info {"type":"meta"}`, Bitget `api/v2/public/time`. Bitget is pinged even though the repo has no Bitget trading integration — it's a liveness probe on the data source that CoinGlass aggregates from.
+  - `host_stats()` — `os.getloadavg()` → CPU %, `shutil.disk_usage("/")` → disk %, `/proc/meminfo` → MemTotal / MemAvailable (Linux only; returns None on Darwin so the formatter prints `—`).
+- **`telegram_bot/handlers.py`** — 7 async command handlers, each `async def handle_X(ctx: HandlerContext) -> str`. Handlers return MarkdownV2 strings; they do NOT send Telegram messages directly. `HandlerContext(cfg, chat_id, args, message_id)`.
+  - `handle_status` — iterates `REGISTRY`, loads each executor, gathers `pnl_today` + `pnl_total` + `summary["open_positions"]` + systemd state + last-cycle timestamp derived from `os.path.getmtime(entry.state_file)` (scheduler calls `_save_state` every cycle regardless of trades, so mtime is a reliable heartbeat). Each entry wrapped in its own try/except; one broken state file renders `❌ error: …` without killing the rest.
+  - `handle_pnl` — per-strategy; returns `format_pnl_not_deployed` for stubs.
+  - `handle_trades [4h|2h|1h] [N]` — default `strategy=4h, N=10`, clamps N ∈ [1, 50]. Unknown arg → `format_usage_trades`.
+  - `handle_positions` — aggregates across all deployed strategies. Fetches current prices in parallel via `asyncio.gather([asyncio.wait_for(asyncio.to_thread(ex.get_current_price, coin), timeout=2.0), ...])`. Per-coin failure → row renders `Current: —, Unrealized: —` rather than crashing the whole command. Computes estimated LONG liquidation as `entry * (1 - 1/leverage)` (matches `hl_snapshots.py` estimation style).
+  - `handle_config` / `handle_health` / `handle_help` — trivial.
+  - `parse_command("/trades@botname 4h 5")` → `("/trades", ["4h", "5"])`. Strips the optional `@botname` that Telegram appends in group chats.
+- **`scripts/test_telegram_bot.py`** — standalone integration test (no pytest), matches `scripts/test_paper_bot.py` style. 71 assertions across 7 blocks:
+  1. MarkdownV2 escape — every special, decimal round-trip, sparkline passthrough, empty-string.
+  2. Formatters — all 8 builders, including `format_trades` with N>limit (omitted-rows marker), `format_status` with all 4 states (active/stopped/not_deployed/error), sparkline count and endpoints.
+  3. PnL aggregations — `pnl_today` today-vs-yesterday split, `equity_by_day` carries prior-day value, `sharpe_ratio` matches a hand-computed value to 1e-6.
+  4. Rate limiter — window enforcement + per-chat independence (via injectable clock).
+  5. Registry — `find_entry` case + trailing-h normalization, `load_executor` with tempdir state, corrupt-file recovery.
+  6. Dispatcher + handlers — `AsyncMock` stand-ins for `send_message` / `edit_message` / `systemctl` / `ping_all`; patches `PaperExecutor.get_current_price` to avoid live ccxt. Exercises `/help` (direct send, no loading), `/status` (loading + edit), `/trades 4h 5` (arg parse + rendering), `/trades 2h` (stub path), `/trades xyz` (usage error), `/positions` (mock prices), `/config`, `/health`, unauthorized chat via `_is_authorized` directly, rate-limited second call, handler-crash isolation.
+  7. Edge cases — `/positions` with a `get_current_price` that raises → rows show `Unrealized: —` and the command still completes.
+  Mocking note: tests must patch both `telegram_bot.handlers.REGISTRY` AND `telegram_bot.registry.REGISTRY` because `find_entry` in registry.py consults the latter and bypasses the former.
+- **`systemd/liq-telegram-bot.service`** — clone of `liq-paper-bot.service`. `Type=simple` + `Restart=always` + `RestartSec=30`, `ExecStart=.venv/bin/python -m telegram_bot.app`, `SyslogIdentifier=liq-telegram-bot`. Not enabled by default.
+
+**Deploy (manual, after `git pull`)**:
+
+```bash
+cd ~/liquidation-bot && git pull
+.venv/bin/python scripts/test_telegram_bot.py       # expect PASS: 71 | FAIL: 0
+sudo cp systemd/liq-telegram-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now liq-telegram-bot.service
+sudo journalctl -u liq-telegram-bot -f
+```
+
+Then in the Telegram chat that matches `LIQ_TELEGRAM_CHAT_ID`:
+
+- `/help` — list of commands.
+- `/status` — all three strategy slots; 2H / 1H render `⚪ not deployed`.
+- `/health` — `liq-paper-bot`, `liq-telegram-bot`, 4 API pings, host stats, last-hour errors.
+
+**Do NOT**:
+
+- add trade-mutating commands (`/close`, `/halt`, `/kill`, `/deposit`). Paper bot is read-only over Telegram. Any live-execution work belongs in a separate session with its own threat model.
+- drop the `chat_id` authorization gate in `polling.py:_is_authorized`. The bot has no other access control.
+- re-use `collectors.alerts.send_alert` — it hard-codes `parse_mode: HTML` and does not support `editMessage`, which the loading→final reply pattern needs. `bot/alerts.py` stays on HTML for outbound notifications; `telegram_bot/` is MarkdownV2 only.
+- change the `command_reply_timeout_s` default below 15s without first profiling `/health` on the VPS — the 4 parallel pings + systemd subprocess + aiohttp DNS can approach 5-8s under load.
+- add a second Telegram-library dependency. The raw aiohttp wrappers are deliberately minimal; adding python-telegram-bot or aiogram would roughly double the install size of the venv and introduce transitive deps for a feature we already have.
+
+**Known limitations**:
+
+- `offset` is in-memory only. After a restart, Telegram may replay up to 24h of buffered commands. For `/status`-style reads this is harmless. If we ever add mutating commands, persist `offset` to disk.
+- On Darwin dev boxes without `systemctl`, `/status` shows systemd state as `unknown` and still renders `active` in the strategy chip (we treat `unknown == active` for display purposes so local dev is readable). On the VPS, `systemctl` is always present.
+- Long-poll means the bot holds one HTTP connection open at all times. If the VPS has a strict NAT timeout < 40s, lower `poll_timeout_s` accordingly.
