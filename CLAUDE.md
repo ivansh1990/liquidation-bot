@@ -877,3 +877,78 @@ psql -d liquidation -c "SELECT symbol, COUNT(*), MIN(timestamp)::date FROM coing
 - Add Net Position collection to live 4H/hourly collectors (`coinglass_oi_collector.py`) in Phase 1 — backfill-only until research PASSes.
 - Enable multi-exchange aggregation in Phase 1. Single exchange (Binance) is sufficient for hypothesis testing and keeps volume comparable across metrics already collected from Binance (OI, funding, taker).
 - Extend `--days` above 180 (Startup tier cap).
+
+## Session L10 Phase 2 — Net Position Research
+
+Research script testing whether net position flow filters improve `market_flush` signal. Matrix: 2 hypotheses × 3 z-thresholds × 3 TF = 18 variants + 1 baseline sanity per interval = 19 backtests (21 rows in the final ranking — 3 baseline reference rows give cross-interval context).
+
+### Hypotheses
+
+- **H1 Contrarian:** `market_flush` AND `net_short_change_zscore > z_netpos` — shorts capitulated, reversion expected.
+- **H2 Confirmation:** `market_flush` AND `net_long_change_zscore > z_netpos` — longs confirming bottom, follow-through expected.
+
+### Key design decisions
+
+- **Z-score normalization per-coin** — raw `net_*_change` values span 5 orders of magnitude across coins (PEPE vs BTC), so absolute thresholds are meaningless. Z-score uses `_zscore_tf` (imported from L8), same 15-calendar-day window as baseline (`_z_window`: h4→90, h2→180, h1→360 bars).
+- **Cumulative fields unused** — `net_long_change_cum` / `net_short_change_cum` / `net_position_change_cum` are redundant with deltas for a flow filter. Reserved for Phase 3 regime detection if edge requires it.
+- **Net Position is ADDITIVE** — filters are `MARKET_FLUSH_FILTERS + [(col, ">", z_netpos)]` so the locked L3b-2 thresholds (z_self>1.0, n_coins>=4) are always preserved verbatim.
+- **Walk-forward mandatory** — same 4-fold split as L8 (`split_folds` reused). 3 z-thresholds × 2 hypotheses = 6 filters per interval, so overfit risk is real.
+- **Look-ahead guardrail** — variants with pooled OOS Sharpe > 8.0 are flagged MARGINAL (not PASS) and require manual review, mirroring the convention the architect called out during planning.
+
+### New files
+
+- `scripts/research_netposition.py` — standalone research driver. Reuses `build_features_tf`, `compute_signals_tf`, `_zscore_tf`, `_z_window`, `load_{liquidations,oi}_tf`, `load_funding`, `fetch_klines_ohlcv`, `compute_cross_coin_features`, `apply_combo`, `_metrics_for_trades`, `_try_load_with_pepe_fallback`, `split_folds`. Adds `load_netposition_tf`, `build_netposition_features`, `attach_netposition`, `build_hypothesis_filters`, `run_variant`, `run_walkforward`, `evaluate_verdict`, `format_variant_block`, `format_final_ranking`.
+- `scripts/test_research_netposition.py` — 12 offline PASS / 15 with optional DB smoke. Four blocks: feature engineering (5), filter application (4), metrics + walk-forward (3), DB smoke (3).
+
+### PASS criteria (all 6 must hold)
+
+Primary (inherited from L8):
+1. Pooled OOS Sharpe > 2.0
+2. Win% > 55%
+3. N trades >= 100
+4. >= 2/3 OOS folds positive
+5. Pooled OOS Sharpe > 1.0 (formally redundant with #1, documented per spec)
+
+Extended (Smart Filter awareness):
+6. trades/day median >= 70% of baseline for same interval — critical for the >= 14 trading days / 30 requirement.
+
+Verdicts:
+- **PASS:** all 6.
+- **MARGINAL:** primary 5 met, extended #6 failed OR Sharpe > 8.0 (look-ahead suspicion).
+- **FAIL:** any primary criterion not met, or walk-forward skipped (N < WF_MIN_TRADES).
+
+### Expected outcomes
+
+- **h4 baseline already PASS** → NetPos filter may strictly dominate (higher Sharpe, trade rate >= 70%) = true PASS, or drop trade rate too far = MARGINAL.
+- **h2 / h1 baseline FAIL** → filter may rescue into PASS (feeds into L11 2H/1H executor decision) or confirm FAIL (NetPos insufficient).
+- At `--interval h4` the script prints a parity banner comparing observed vs L8-reference Sharpe/Win/N and warns (does not raise) on Sharpe drift > 5%.
+
+### Run
+
+```bash
+# Offline tests
+.venv/bin/python scripts/test_research_netposition.py                  # 12 PASS
+
+# Full matrix (architect triggers on VPS, ~15-30 min)
+.venv/bin/python scripts/research_netposition.py | tee analysis/netposition_research_$(date +%F).txt
+
+# Debug slice
+.venv/bin/python scripts/research_netposition.py --intervals h4 --hypotheses H1 --thresholds 1.0
+```
+
+### Phase 3 (conditional)
+
+If any (hypothesis, interval, threshold) PASSes with trades/day >= 70 % baseline:
+- Add `NET_POSITION_FILTER` opt-in config flag to `bot/signal.py`.
+- Integrate the winning `(hypothesis, z_netpos)` into live signal computation.
+- Deploy only winning variants to paper trading for a 7-day A/B test.
+- Rejected variants documented here with FAIL verdict so future sessions don't re-explore the same combos.
+
+### Do NOT
+
+- Change locked L3b-2 thresholds (z_self=1.0, z_market=1.5, n_coins>=4). Net Position is an **additional filter on baseline**, not a replacement.
+- Modify `bot/signal.py`, `bot/paper_executor.py`, or anything in `exchange/` in Phase 2 — research-only.
+- Add new DB tables (data layer complete in Phase 1).
+- Extend the threshold grid beyond 0.5 / 1.0 / 1.5 without separate plan approval (overfit risk grows quadratically with grid size).
+- Recompute baseline numbers from scratch — L8 reference (h4: N=428, Win%=61.0, Sharpe=5.87) is the source of truth for parity checks.
+- Mark Sharpe > 8.0 as PASS without manual inspection (look-ahead smell).
