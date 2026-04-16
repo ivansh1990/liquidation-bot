@@ -58,6 +58,9 @@ liquidation-bot/
 │   ├── analyze_liq_clusters_v2.py — L6b: OI-normalized cluster strength analysis (distance × strength matrix)
 │   ├── test_liq_analyzer_v2.py — L6b: offline tests for analyze_liq_clusters_v2.py (34 assertions)
 │   ├── test_coinglass_collector.py — L6c: offline tests for coinglass_oi_collector (29 assertions)
+│   ├── backfill_coinglass_hourly.py — L8: Backfill 180 days of CoinGlass h1/h2 liquidations + OI (one-shot)
+│   ├── backtest_market_flush_multitf.py — L8: market_flush backtest on h1/h2/h4 with walk-forward
+│   ├── test_backtest_multitf.py — L8: offline tests for multi-TF backtest (34 assertions)
 │   └── quick_analysis.py   — Data analysis (run after 2+ days)
 ├── state/                  — Bot state (paper + showcase, gitignored)
 ├── systemd/                — Service and timer files for VPS
@@ -118,6 +121,10 @@ BTC, ETH, SOL, DOGE, LINK, AVAX, SUI, ARB, WIF, PEPE
 | `coinglass_liquidations` | Aggregated liquidations (4H) | symbol, long_vol_usd, short_vol_usd, long_count, short_count |
 | `coinglass_oi` | Aggregated OI OHLC (4H) | symbol, open_interest (close), oi_high, oi_low |
 | `coinglass_funding` | Aggregated funding rate (8H or 4H) | symbol, funding_rate |
+| `coinglass_liquidations_h1` | Aggregated liquidations (1H, L8) | symbol, long_vol_usd, short_vol_usd, long_count, short_count |
+| `coinglass_liquidations_h2` | Aggregated liquidations (2H, L8) | symbol, long_vol_usd, short_vol_usd, long_count, short_count |
+| `coinglass_oi_h1` | Aggregated OI OHLC (1H, L8) | symbol, open_interest, oi_high, oi_low |
+| `coinglass_oi_h2` | Aggregated OI OHLC (2H, L8) | symbol, open_interest, oi_high, oi_low |
 
 `is_liq_estimated` in `hl_position_snapshots`: `FALSE` = liquidation price from API, `TRUE` = estimated via `entry_px * (1 ± 1/leverage)`. Filter with `WHERE NOT is_liq_estimated` for analysis requiring precise data.
 
@@ -716,3 +723,98 @@ sudo systemctl restart liq-showcase-bot
 - Skip state persist between market fill and TP/SL placement — crash recovery requires it.
 - Guess exit reason on Binance API failure — leave position in state, retry next cycle.
 - Add new dependencies to requirements.txt (ccxt already present).
+
+## Session L8 — Multi-Timeframe Market Flush Backtest
+
+Motivation: the 4H `market_flush` signal (L3b-2) produces only 0–2 trades/day, insufficient for Binance lead trader Smart Filter (≥65% win days, ≥14 trading days/30). Testing the same signal on 1H and 2H intervals to increase trade frequency. CoinGlass Startup tier ($79/mo) was purchased to unlock h1/h2 historical data (180 days, unavailable on Hobbyist).
+
+### New scripts
+
+- **`scripts/backfill_coinglass_hourly.py`** — backfill h1/h2 liquidation + OI data from CoinGlass into new tables. CLI: `--interval h1|h2` (required), `--days 180`, `--coin`, `--verbose`, `--skip-oi`. Includes API probe that fails fast if CoinGlass does not support the requested interval. Creates tables inline: `coinglass_liquidations_{h1,h2}` and `coinglass_oi_{h1,h2}` (same schemas as 4H counterparts). Reuses `CG_SYMBOLS`, `CG_FALLBACKS`, `CG_EXCHANGES`, `REQUEST_SLEEP_S` from `backfill_coinglass.py` and `_pick_float`, `build_oi_rows`, `OI_PATH` from `backfill_coinglass_oi.py`. PEPE → 1000PEPE fallback. Rate limit 2.5s. Idempotent via `ON CONFLICT DO NOTHING`.
+
+- **`scripts/backtest_market_flush_multitf.py`** — backtest `market_flush` combo on h1/h2/h4 with walk-forward. CLI: `--interval h1|h2|h4` (default h4). Tests ONLY `market_flush` (not all 9 combos from `backtest_combo.py`). Key multi-TF adaptations:
+  - **`compute_signals_tf(liq_df, price_df, bar_hours)`** — mirrors locked `compute_signals` (L2) with 3 parameterized substitutions: z-score window `int(90 * 4 / bar_hours)` (h1=360, h2=180, h4=90), lookback `int(24 / bar_hours)` (h1=24, h2=12, h4=6), forward returns `hours // bar_hours`. All three maintain the same calendar time as the 4H baseline (15-day z-window, 24h rolling sum).
+  - **Holding periods per interval**: h1=[4,8,16,48]h, h2=[8,16,32,48]h, h4=[4,8,12,24]h (L3b-2 baseline). All include 8h for cross-interval ranking.
+  - **`build_features_tf`** — mirrors `build_features` with scaled `drawdown_24h` (`pct_change(24/bar_hours)`), `oi_change_24h`, and scaled `_zscore_tf`.
+  - **`fetch_klines_ohlcv`** — parameterized timeframe ("1h"/"2h"/"4h") version of `fetch_klines_4h_ohlcv`.
+  - **`load_liquidations_tf` / `load_oi_tf`** — load from interval-specific tables (h1/h2) or base tables (h4).
+  - Funding loaded from existing `coinglass_funding` (h8, forward-filled to any bar grid).
+  - Reuses `apply_combo`, `_metrics_for_trades`, `compute_cross_coin_features` from `backtest_combo.py`, `split_folds` from `walkforward_h1_flush.py`.
+  - Walk-forward: 4 folds, PASS criteria = pooled Sharpe > 2.0 AND Win% > 55% AND N ≥ 100 AND ≥2/3 OOS folds positive AND pooled OOS Sharpe > 1.0.
+  - At `--interval h4`, prints sanity check vs L3b-2 reference (Sharpe ~5.60, win ~60.7%, N ~422).
+
+- **`scripts/test_backtest_multitf.py`** — 34 offline assertions, 8 blocks:
+  1. `compute_signals_tf` parity at h4 — element-wise equality with locked `compute_signals` on synthetic data (`long_vol_zscore`, `short_vol_zscore`, `total_vol`, `return_8h`, `long_vol_24h`, `ratio_24h`).
+  2. Z-score scaling at h1 — window=360, first 359 NaN, lookback=24.
+  3. Z-score scaling at h2 — window=180, lookback=12.
+  4. Forward returns at h1 — `return_4h` shifts 4 bars, `return_48h` shifts 48 bars, `return_8h` shifts 8 bars.
+  5. Holding hours map — 8h present in all intervals, h4 matches L3b-2.
+  6. Table name derivation — h4 uses base tables, h1/h2 use suffixed tables.
+  7. `build_features_tf` drawdown scaling — h1 uses `pct_change(24)`, h4 uses `pct_change(6)`.
+  8. Z-score window constants — all intervals give 15 calendar days.
+
+### New tables
+
+| Table | Interval | Schema matches |
+|-------|----------|---------------|
+| `coinglass_liquidations_h1` | 1H | `coinglass_liquidations` |
+| `coinglass_liquidations_h2` | 2H | `coinglass_liquidations` |
+| `coinglass_oi_h1` | 1H | `coinglass_oi` |
+| `coinglass_oi_h2` | 2H | `coinglass_oi` |
+
+All with `UNIQUE (timestamp, symbol)`, created inline by `backfill_coinglass_hourly.py`.
+
+### Run
+
+```bash
+# Tests (offline, no DB/API needed)
+.venv/bin/python scripts/test_backtest_multitf.py    # expect PASS: 34 | FAIL: 0
+
+# Backfill h1/h2 data (requires .env with LIQ_COINGLASS_API_KEY + DB)
+.venv/bin/python scripts/backfill_coinglass_hourly.py --interval h1 --days 180
+.venv/bin/python scripts/backfill_coinglass_hourly.py --interval h2 --days 180
+
+# Verify backfill
+psql -d liquidation -c "SELECT symbol, COUNT(*), MIN(timestamp), MAX(timestamp) FROM coinglass_liquidations_h1 GROUP BY symbol;"
+
+# Run backtests
+.venv/bin/python scripts/backtest_market_flush_multitf.py --interval h4 | tee analysis/market_flush_h4_reference.txt
+.venv/bin/python scripts/backtest_market_flush_multitf.py --interval h2 | tee analysis/market_flush_h2.txt
+.venv/bin/python scripts/backtest_market_flush_multitf.py --interval h1 | tee analysis/market_flush_h1.txt
+```
+
+### Signal parameters (locked, do NOT change)
+
+- `z_threshold_self` = 1.0 (`long_vol_zscore > 1.0`)
+- `z_threshold_market` = 1.5 (for counting `n_coins_flushing`)
+- `min_coins_flushing` = 4
+- Ranking at h=8 (cross-interval comparison)
+
+### CoinGlass h1/h2 support status
+
+**UNKNOWN** — to be filled after running the API probe on VPS:
+```bash
+.venv/bin/python scripts/backfill_coinglass_hourly.py --interval h1 --coin BTC --verbose
+```
+
+### Walk-forward results
+
+**TBD** — to be filled after VPS runs.
+
+### Expected data volumes
+
+| Interval | Bars/day | 180 days | API cap (Startup) | Likely rows |
+|----------|----------|----------|-------------------|-------------|
+| h1 | 24 | 4320 | TBD | TBD |
+| h2 | 12 | 2160 | TBD | TBD |
+| h4 | 6 | 1080 | 1000 | ~1000 |
+
+### Do NOT
+
+- Change L3b-2 thresholds (z_self=1.0, z_market=1.5, n_coins>=4) — locked.
+- Create live executors for h1/h2 — that is L10 if backtests PASS.
+- Modify `bot/signal.py`, `bot/paper_executor.py` — they are for 4H.
+- Delete existing `coinglass_liquidations`, `coinglass_oi` tables (they are for 4H).
+- Run backfill with `--days > 180` (Startup tier limit).
+- Modify `scripts/backtest_liquidation_flush.py` — locked L2 baseline.
+- Add new dependencies to requirements.txt.
