@@ -1,0 +1,15 @@
+[Unit]
+Description=Liquidation Bot - CoinGlass OI + Funding Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ivan
+WorkingDirectory=/home/ivan/liquidation-bot
+ExecStart=/home/ivan/liquidation-bot/.venv/bin/python -m collectors.coinglass_oi_collector
+EnvironmentFile=/home/ivan/liquidation-bot/.env
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=liq-coinglass-oi

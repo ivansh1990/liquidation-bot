@@ -1,0 +1,10 @@
+[Unit]
+Description=CoinGlass OI + funding collector (every 4h, aligned to UTC)
+
+[Timer]
+OnCalendar=*-*-* 00,04,08,12,16,20:05:00 UTC
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

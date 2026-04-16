@@ -12,6 +12,7 @@ liquidation-bot/
 │   ├── hl_websocket.py     — Hyperliquid WebSocket: live trades, prices
 │   ├── hl_snapshots.py     — Hyperliquid: position snapshots → liquidation map
 │   ├── binance_collector.py — Binance: OI, funding, L/S ratio, taker
+│   ├── coinglass_oi_collector.py — CoinGlass: OI + funding (4H timer)
 │   └── alerts.py           — Telegram notifications
 ├── bot/
 │   ├── config.py           — BotConfig (subclasses collectors.config.Config)
@@ -48,6 +49,7 @@ liquidation-bot/
 │   ├── test_liq_analyzer.py — L6: offline tests for analyze_liq_clusters.py (41 assertions)
 │   ├── analyze_liq_clusters_v2.py — L6b: OI-normalized cluster strength analysis (distance × strength matrix)
 │   ├── test_liq_analyzer_v2.py — L6b: offline tests for analyze_liq_clusters_v2.py (34 assertions)
+│   ├── test_coinglass_collector.py — L6c: offline tests for coinglass_oi_collector (29 assertions)
 │   └── quick_analysis.py   — Data analysis (run after 2+ days)
 ├── state/                  — Paper-bot state (paper_state.json, gitignored)
 ├── systemd/                — Service and timer files for VPS
@@ -115,7 +117,7 @@ The four `binance_*` tables gain a `UNIQUE(timestamp, symbol)` constraint the fi
 
 `coinglass_liquidations` is created by `scripts/backfill_coinglass.py` (inline `CREATE TABLE IF NOT EXISTS` with `CONSTRAINT uq_cg_liq UNIQUE (timestamp, symbol)`). There is no hourly CoinGlass collector yet — we only backfill and backtest until edge is confirmed.
 
-`coinglass_oi` and `coinglass_funding` are created by `scripts/backfill_coinglass_oi.py` (inline `CREATE TABLE IF NOT EXISTS` with `CONSTRAINT uq_cg_oi` / `uq_cg_fr` on `(timestamp, symbol)`). Same policy: backfill-only, no hourly collector until edge is confirmed via a combo-signal backtest that joins `coinglass_liquidations ⋈ coinglass_oi ⋈ coinglass_funding` on `(timestamp, symbol)`.
+`coinglass_oi` and `coinglass_funding` are created by `scripts/backfill_coinglass_oi.py` (inline `CREATE TABLE IF NOT EXISTS` with `CONSTRAINT uq_cg_oi` / `uq_cg_fr` on `(timestamp, symbol)`). Live 4H collector `collectors/coinglass_oi_collector.py` (L6c) keeps both tables current via `liq-coinglass-oi.timer` (every 4H, 5 min after bar close). Backfill script is still used for initial historical fill; live collector and backfill coexist safely via `ON CONFLICT DO NOTHING`.
 
 ## Running Locally
 
@@ -199,6 +201,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now liq-hl-websocket.service
 sudo systemctl enable --now liq-hl-snapshots.timer
 sudo systemctl enable --now liq-binance.timer
+sudo systemctl enable --now liq-coinglass-oi.timer
 
 # Verify
 sudo systemctl status liq-hl-websocket
@@ -221,7 +224,7 @@ sudo systemctl restart liq-hl-websocket
 All prefixed with `LIQ_`:
 - `LIQ_DB_HOST`, `LIQ_DB_PORT`, `LIQ_DB_NAME`, `LIQ_DB_USER`, `LIQ_DB_PASSWORD`
 - `LIQ_TELEGRAM_BOT_TOKEN`, `LIQ_TELEGRAM_CHAT_ID`
-- `LIQ_COINGLASS_API_KEY` — CoinGlass Hobbyist-tier API key (required for `backfill_coinglass.py` and `backfill_coinglass_oi.py`)
+- `LIQ_COINGLASS_API_KEY` — CoinGlass Hobbyist-tier API key (required for `backfill_coinglass.py`, `backfill_coinglass_oi.py`, and the live `coinglass_oi_collector`)
 
 ## Constraints
 
@@ -562,4 +565,48 @@ With ~3 days of `hl_liquidation_map` (Apr 13-16) and `coinglass_oi` covering Oct
 - Modify bot/, collectors/, telegram_bot/.
 - Delete `analyze_liq_clusters.py` (v1) — kept for reference.
 - Change existing DB tables or add new ones.
+- Add new dependencies to requirements.txt.
+
+## Session L6c — Live CoinGlass OI Collector
+
+Motivation: L6b showed only 39% OI coverage because `coinglass_oi` data stopped at the last manual backfill (2026-04-14 16:00 UTC), while `hl_liquidation_map` continues via live 15-min snapshots. The `merge_asof` with 4h tolerance drops all recent snapshots without matching OI. A live 4H collector keeps `coinglass_oi` and `coinglass_funding` current so L6b can be re-run in 2-3 weeks with ~100% OI coverage.
+
+### New files
+
+- **`collectors/coinglass_oi_collector.py`** — live collector, runs every 4H via systemd timer. Fetches latest OI (h4) and funding rate (h8/h4) from CoinGlass for all 10 coins. Reuses `build_oi_rows`, `build_funding_rows`, `_pick_float`, `ensure_tables`, `insert_oi`, `insert_funding`, and all CoinGlass constants from `scripts/backfill_coinglass_oi.py` (imported, not copied). Takes last 5 bars from each API response (20h of OI, enough to cover a missed cycle). PEPE → 1000PEPE fallback. Logging via `logging` module (matches `binance_collector.py`). Idempotent via `ON CONFLICT DO NOTHING`. Total runtime: ~50-60s (10 coins × 2 endpoints × 2.5s rate limit).
+
+- **`systemd/liq-coinglass-oi.service`** — `Type=oneshot`, mirrors `liq-binance.service`. `ExecStart=.venv/bin/python -m collectors.coinglass_oi_collector`.
+
+- **`systemd/liq-coinglass-oi.timer`** — `OnCalendar=*-*-* 00,04,08,12,16,20:05:00 UTC`. Runs 5 minutes after each 4H bar close (gives CoinGlass time to finalize). `Persistent=true` catches up after downtime.
+
+- **`scripts/test_coinglass_collector.py`** — 29 offline assertions, 7 blocks: `_pick_float` multi-key fallback, `build_oi_rows` parsing, `build_funding_rows` parsing, `fetch_latest_oi` with mocked HTTP + PEPE fallback + tail slicing, `fetch_latest_funding` combo fallback, `_cg_symbols` helper, optional live smoke test (skipped without API key).
+
+### Run
+
+```bash
+# Tests
+.venv/bin/python scripts/test_coinglass_collector.py    # expect PASS: 29 | FAIL: 0
+
+# Manual one-shot (requires .env with LIQ_COINGLASS_API_KEY + DB)
+.venv/bin/python -m collectors.coinglass_oi_collector
+
+# Verify
+psql -d liquidation -c "SELECT MAX(timestamp), COUNT(*) FROM coinglass_oi;"
+```
+
+### Deploy
+
+```bash
+cd ~/liquidation-bot && git pull
+.venv/bin/python scripts/test_coinglass_collector.py
+sudo cp systemd/liq-coinglass-oi.service systemd/liq-coinglass-oi.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now liq-coinglass-oi.timer
+sudo systemctl list-timers | grep liq
+```
+
+### Do NOT
+
+- Modify `scripts/backfill_coinglass_oi.py` — it's for manual backfills, still needed for initial historical fill.
+- Add CoinGlass liquidations collection here — already handled as side-effect in `bot/signal.py:SignalComputer.fetch_recent_liquidations`.
 - Add new dependencies to requirements.txt.
