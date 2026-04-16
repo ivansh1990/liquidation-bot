@@ -137,19 +137,27 @@ async def _get_json(
     return data
 
 
+def _t(r: dict) -> int:
+    """Extract unix seconds from a CoinGlass record, normalizing ms→s."""
+    t = int(r.get("time") or r.get("t") or 0)
+    return t // 1000 if t > 10**12 else t
+
+
 def _window_filter(records: list[dict], start_ts: int, end_ts: int) -> list[dict]:
     """Filter response rows to [start_ts, end_ts], normalizing ms→s."""
-    def _t(r: dict) -> int:
-        t = int(r.get("time") or r.get("t") or 0)
-        return t // 1000 if t > 10**12 else t
     return [r for r in records if start_ts <= _t(r) <= end_ts]
+
+
+def _bar_seconds(interval: str) -> int:
+    """Bar width in seconds for a CoinGlass interval."""
+    return {"h1": 3600, "h2": 7200, "h4": 14400}[interval]
 
 
 # ---------------------------------------------------------------------------
 # Fetchers
 # ---------------------------------------------------------------------------
 
-async def fetch_liquidations(
+async def _fetch_liquidations_page(
     session: aiohttp.ClientSession,
     api_key: str,
     symbol_cg: str,
@@ -158,7 +166,7 @@ async def fetch_liquidations(
     end_ts: int,
     verbose: bool = False,
 ) -> list[dict]:
-    """Fetch aggregated liquidation history for a symbol at h1/h2."""
+    """Fetch ONE page of aggregated liquidation history (≤1000 rows)."""
     url = f"{CG_BASE_LIQ}/aggregated-history"
     params = {
         "symbol": symbol_cg,
@@ -181,7 +189,7 @@ async def fetch_liquidations(
     return _window_filter(data["data"], start_ts, end_ts)
 
 
-async def fetch_oi_hourly(
+async def _fetch_oi_page(
     session: aiohttp.ClientSession,
     api_key: str,
     symbol_cg: str,
@@ -190,7 +198,7 @@ async def fetch_oi_hourly(
     end_ts: int,
     verbose: bool = False,
 ) -> list[dict]:
-    """Fetch aggregated OI OHLC for a symbol at h1/h2."""
+    """Fetch ONE page of aggregated OI OHLC history (≤1000 rows)."""
     url = f"{CG_BASE_OI}{OI_PATH}"
     params = {
         "symbol": symbol_cg,
@@ -211,6 +219,119 @@ async def fetch_oi_hourly(
             print(f"  Warning: OI {msg} for {symbol_cg}@{interval}")
         return []
     return _window_filter(data["data"], start_ts, end_ts)
+
+
+# ---------------------------------------------------------------------------
+# Paginating wrappers: walk endTime backwards until start_ts is covered.
+# ---------------------------------------------------------------------------
+
+MAX_PAGES = 10  # safety cap; h1 at 180d ≈ 5, h2 ≈ 3, so 10 is generous.
+
+
+async def _paginate(
+    page_fn,
+    session: aiohttp.ClientSession,
+    api_key: str,
+    symbol_cg: str,
+    interval: str,
+    start_ts: int,
+    end_ts: int,
+    verbose: bool,
+    paginate: bool,
+    label: str,
+) -> list[dict]:
+    """
+    Walk `endTime` backwards calling `page_fn` until either `start_ts` is
+    covered, MAX_PAGES is reached, or the API stops yielding older rows.
+
+    When `paginate=False`, makes a single request (preserves pre-pagination
+    behavior for tiers where endTime is ignored).
+    """
+    # First page: always fetch latest 1000 bars (end_ts == now).
+    pages: list[dict] = []
+    first_rows = await page_fn(
+        session, api_key, symbol_cg, interval, start_ts, end_ts, verbose,
+    )
+    if not first_rows:
+        return []
+    pages.extend(first_rows)
+
+    if not paginate:
+        return pages
+
+    bar_s = _bar_seconds(interval)
+    ts_list = sorted({_t(r) for r in first_rows})
+    oldest = ts_list[0]
+    if oldest <= start_ts:
+        return pages
+    seen_oldest = oldest
+    cur_end = oldest - bar_s
+
+    for page_idx in range(1, MAX_PAGES):
+        if cur_end <= start_ts:
+            break
+        await asyncio.sleep(REQUEST_SLEEP_S)
+        if verbose:
+            end_dt = datetime.fromtimestamp(cur_end, tz=timezone.utc)
+            print(f"    paginate {label} page={page_idx + 1} endTime={end_dt.isoformat()}")
+        rows = await page_fn(
+            session, api_key, symbol_cg, interval, start_ts, cur_end, verbose,
+        )
+        if not rows:
+            break
+        ts_list = sorted({_t(r) for r in rows})
+        oldest = ts_list[0]
+        pages.extend(rows)
+        # API returned the same or newer window → either endTime ignored mid-run
+        # or we've exhausted the available history.
+        if oldest >= seen_oldest:
+            if verbose:
+                print(f"    paginate {label}: no older data (oldest={oldest} >= prev {seen_oldest}), stop")
+            break
+        seen_oldest = oldest
+        if oldest <= start_ts:
+            break
+        cur_end = oldest - bar_s
+    else:
+        print(f"  ⚠ {label}: MAX_PAGES={MAX_PAGES} reached, may be incomplete")
+
+    return pages
+
+
+async def fetch_liquidations(
+    session: aiohttp.ClientSession,
+    api_key: str,
+    symbol_cg: str,
+    interval: str,
+    start_ts: int,
+    end_ts: int,
+    verbose: bool = False,
+    paginate: bool = True,
+) -> list[dict]:
+    """Fetch aggregated liquidation history for [start_ts, end_ts], paginating."""
+    return await _paginate(
+        _fetch_liquidations_page,
+        session, api_key, symbol_cg, interval, start_ts, end_ts,
+        verbose, paginate, label=f"LIQ {symbol_cg}@{interval}",
+    )
+
+
+async def fetch_oi_hourly(
+    session: aiohttp.ClientSession,
+    api_key: str,
+    symbol_cg: str,
+    interval: str,
+    start_ts: int,
+    end_ts: int,
+    verbose: bool = False,
+    paginate: bool = True,
+) -> list[dict]:
+    """Fetch aggregated OI OHLC history for [start_ts, end_ts], paginating."""
+    return await _paginate(
+        _fetch_oi_page,
+        session, api_key, symbol_cg, interval, start_ts, end_ts,
+        verbose, paginate, label=f"OI {symbol_cg}@{interval}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +438,7 @@ async def probe_api(
     Returns True if the endpoint returns data, False otherwise.
     """
     print(f"API probe: testing BTC liquidations at interval={interval}...")
-    records = await fetch_liquidations(
+    records = await _fetch_liquidations_page(
         session, api_key, "BTC", interval, 0, int(time.time()),
         verbose=verbose,
     )
@@ -331,6 +452,55 @@ async def probe_api(
     print(f"    2. API key does not have Startup tier access")
     print(f"    3. Network / auth error")
     print(f"  Check the CoinGlass API docs or upgrade your tier.")
+    return False
+
+
+async def probe_end_time_honored(
+    session: aiohttp.ClientSession,
+    api_key: str,
+    interval: str,
+    verbose: bool,
+) -> bool:
+    """
+    Test whether CoinGlass honors `endTime` on the aggregated-history endpoint.
+
+    We request BTC with endTime = now − 50 days and check the newest returned
+    timestamp. If it respects the bound, we can paginate backward.
+    If it ignores it (returns current bars regardless), we fall back to the
+    single-request pattern and accept truncated history.
+    """
+    bar_s = _bar_seconds(interval)
+    now_ts = int(time.time())
+    probe_end_ts = now_ts - 50 * 86400
+    print(f"endTime honor probe: requesting BTC@{interval} with endTime=50d ago...")
+    records = await _fetch_liquidations_page(
+        session, api_key, "BTC", interval, 0, probe_end_ts, verbose=verbose,
+    )
+    if not records:
+        print(f"  ⚠ probe returned no records — assuming endTime NOT honored")
+        return False
+    ts_list = sorted({_t(r) for r in records})
+    newest = ts_list[-1]
+    # Allow up to 2 bar widths of slack in case the API bound is inclusive/rounded.
+    if newest <= probe_end_ts + 2 * bar_s:
+        newest_dt = datetime.fromtimestamp(newest, tz=timezone.utc)
+        print(
+            f"  ✅ endTime honored — newest returned bar is {newest_dt.isoformat()} "
+            f"(≤ probe endTime). Pagination enabled."
+        )
+        return True
+
+    newest_dt = datetime.fromtimestamp(newest, tz=timezone.utc)
+    probe_dt = datetime.fromtimestamp(probe_end_ts, tz=timezone.utc)
+    print(
+        f"  ⚠ endTime IGNORED — newest bar is {newest_dt.isoformat()} "
+        f"but endTime was {probe_dt.isoformat()}."
+    )
+    print(
+        f"  Falling back to single-request mode. "
+        f"Expect ~{1000 * bar_s // 86400}d of history per coin "
+        f"(instead of requested 180d)."
+    )
     return False
 
 
@@ -423,6 +593,12 @@ async def main() -> None:
             sys.exit(1)
         await asyncio.sleep(REQUEST_SLEEP_S)
 
+        # ---- endTime honor probe: decides whether to paginate ----
+        paginate = await probe_end_time_honored(
+            session, api_key, interval, args.verbose,
+        )
+        await asyncio.sleep(REQUEST_SLEEP_S)
+
         # ---- Main loop ----
         for coin, primary_sym in coins:
             t_coin = time.monotonic()
@@ -431,14 +607,14 @@ async def main() -> None:
             print(f"[{coin}] LIQ @{interval} (symbol={primary_sym})...")
             liq_records = await fetch_liquidations(
                 session, api_key, primary_sym, interval, start_ts, end_ts,
-                verbose=args.verbose,
+                verbose=args.verbose, paginate=paginate,
             )
             if not liq_records and coin in CG_FALLBACKS:
                 fb = CG_FALLBACKS[coin]
                 print(f"  No data for {primary_sym}, trying fallback {fb}...")
                 liq_records = await fetch_liquidations(
                     session, api_key, fb, interval, start_ts, end_ts,
-                    verbose=args.verbose,
+                    verbose=args.verbose, paginate=paginate,
                 )
 
             if liq_records:
@@ -461,14 +637,14 @@ async def main() -> None:
                 print(f"[{coin}] OI @{interval} (symbol={primary_sym})...")
                 oi_records = await fetch_oi_hourly(
                     session, api_key, primary_sym, interval, start_ts, end_ts,
-                    verbose=args.verbose,
+                    verbose=args.verbose, paginate=paginate,
                 )
                 if not oi_records and coin in CG_FALLBACKS:
                     fb = CG_FALLBACKS[coin]
                     print(f"  No OI for {primary_sym}, trying fallback {fb}...")
                     oi_records = await fetch_oi_hourly(
                         session, api_key, fb, interval, start_ts, end_ts,
-                        verbose=args.verbose,
+                        verbose=args.verbose, paginate=paginate,
                     )
 
                 if oi_records:

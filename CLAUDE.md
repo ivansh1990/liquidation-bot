@@ -104,7 +104,7 @@ BTC, ETH, SOL, DOGE, LINK, AVAX, SUI, ARB, WIF, PEPE
 - Header: `CG-API-KEY: <key>`
 - Rate limit: 30 req/min on Hobbyist tier → collectors pause 2.5s between requests
 - Historical range on Hobbyist: 180 days at h4 interval (~1080 records/coin); funding at h8 ≈ 540/coin
-- Hobbyist-tier quirk: aggregated endpoints ignore `startTime`/`endTime` and return the latest ≤1000 buckets — so backfills use a single request per coin and filter the window client-side.
+- Hobbyist-tier quirk: aggregated endpoints ignore `startTime`/`endTime` and return the latest ≤1000 buckets — so Hobbyist-tier backfills (`backfill_coinglass.py`, `backfill_coinglass_oi.py`) use a single request per coin and filter the window client-side. Startup tier honors `endTime`, which `backfill_coinglass_hourly.py` (L8) uses to paginate for >1000-bar windows (walks `endTime` backward page-by-page, ≤10 pages per coin/endpoint).
 - Symbol format: base name (`BTC`, `ETH`, ...); `PEPE` may require `1000PEPE` fallback — both `backfill_coinglass.py` and `backfill_coinglass_oi.py` try the primary name first and fall back automatically.
 
 ## Database Schema (PostgreSQL `liquidation`)
@@ -792,7 +792,18 @@ psql -d liquidation -c "SELECT symbol, COUNT(*), MIN(timestamp), MAX(timestamp) 
 
 ### CoinGlass h1/h2 support status
 
-**UNKNOWN** — to be filled after running the API probe on VPS:
+Startup tier ($79/mo) unlocks h1/h2 intervals **and** honors `startTime`/`endTime` on `aggregated-history` (unlike Hobbyist which ignores them). This lets `backfill_coinglass_hourly.py` paginate by walking `endTime` backward page-by-page. A one-shot `--coin BTC --verbose` probe at startup confirms this behavior each run and falls back to single-request mode with a loud warning if `endTime` is ever silently downgraded.
+
+Pagination details (in `scripts/backfill_coinglass_hourly.py`):
+- First page: `endTime = now` → latest 1000 bars.
+- Next page: `endTime = oldest_returned_ts − bar_width_s` → older 1000 bars.
+- Stop when any of: response empty; `oldest <= start_ts`; `oldest >= prev_oldest` (API returned the same/newer window — either endTime silently broke or history exhausted); `MAX_PAGES = 10` reached.
+- `REQUEST_SLEEP_S = 2.5s` between pages (well under Startup's 80 req/min cap).
+- `ON CONFLICT (timestamp, symbol) DO NOTHING` tolerates overlap between pages.
+
+Expected pages per (coin, endpoint) at 180 days: h1 ≈ 5, h2 ≈ 3. Full run (10 coins × 2 endpoints × h1 ≈ 100 requests) ≈ 4 min plus two probe requests at startup.
+
+Probe command:
 ```bash
 .venv/bin/python scripts/backfill_coinglass_hourly.py --interval h1 --coin BTC --verbose
 ```
@@ -803,11 +814,11 @@ psql -d liquidation -c "SELECT symbol, COUNT(*), MIN(timestamp), MAX(timestamp) 
 
 ### Expected data volumes
 
-| Interval | Bars/day | 180 days | API cap (Startup) | Likely rows |
-|----------|----------|----------|-------------------|-------------|
-| h1 | 24 | 4320 | TBD | TBD |
-| h2 | 12 | 2160 | TBD | TBD |
-| h4 | 6 | 1080 | 1000 | ~1000 |
+| Interval | Bars/day | 180 days | Per-page cap | Pages needed | Expected rows |
+|----------|----------|----------|--------------|--------------|---------------|
+| h1 | 24 | 4320 | 1000 | 5 | ~4320 |
+| h2 | 12 | 2160 | 1000 | 3 | ~2160 |
+| h4 | 6 | 1080 | 1000 | 2 | ~1080 (sibling 4H backfill still single-request, ~1000) |
 
 ### Do NOT
 
