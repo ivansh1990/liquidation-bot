@@ -1,0 +1,19 @@
+[Unit]
+Description=Liquidation Bot - Showcase (live Binance)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ivan
+WorkingDirectory=/home/ivan/liquidation-bot
+ExecStart=/home/ivan/liquidation-bot/.venv/bin/python -m exchange.scheduler
+Restart=always
+RestartSec=30
+EnvironmentFile=/home/ivan/liquidation-bot/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=liq-showcase-bot
+
+[Install]
+WantedBy=multi-user.target

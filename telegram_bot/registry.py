@@ -38,6 +38,13 @@ REGISTRY: list[StrategyEntry] = [
         holding_hours=8,
     ),
     StrategyEntry(
+        key="showcase",
+        label="Showcase (live)",
+        state_file="state/showcase_state.json",
+        systemd_unit="liq-showcase-bot.service",
+        holding_hours=8,
+    ),
+    StrategyEntry(
         key="2h",
         label="2H strategy",
         state_file=None,

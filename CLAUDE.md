@@ -23,7 +23,7 @@ liquidation-bot/
 ├── telegram_bot/           — L5: interactive Telegram command interface
 │   ├── app.py              — Entrypoint: `python -m telegram_bot.app`
 │   ├── config.py           — TelegramBotConfig (subclasses BotConfig)
-│   ├── registry.py         — StrategyEntry + REGISTRY (4H live, 2H/1H stubs)
+│   ├── registry.py         — StrategyEntry + REGISTRY (4H paper, showcase live, 2H/1H stubs)
 │   ├── polling.py          — getUpdates long-poll loop + chat_id auth
 │   ├── telegram_api.py     — Raw aiohttp wrappers + escape_md (MarkdownV2)
 │   ├── rate_limit.py       — Per-chat 5s window
@@ -31,12 +31,20 @@ liquidation-bot/
 │   ├── formatters.py       — MarkdownV2 message builders + unicode sparkline
 │   ├── health.py           — systemd + journalctl + HTTP pings + host stats
 │   └── handlers.py         — Per-command business logic (7 commands)
+├── exchange/               — L7: live Binance Futures execution
+│   ├── __init__.py
+│   ├── config.py           — ExchangeConfig (subclasses BotConfig)
+│   ├── binance_client.py   — Authenticated ccxt wrapper (dry-run + testnet)
+│   ├── safety.py           — SafetyGuard: circuit breakers
+│   ├── live_executor.py    — LiveExecutor: real orders, exchange-side TP/SL
+│   └── scheduler.py        — Main 4H loop (python -m exchange.scheduler)
 ├── scripts/
 │   ├── init_db.py          — Create database and tables
 │   ├── seed_addresses.py   — Seed whale addresses from leaderboard
 │   ├── test_collectors.py  — Integration test for all endpoints
 │   ├── test_paper_bot.py   — L4: offline tests for bot/ (z-score parity, state, signal)
 │   ├── test_telegram_bot.py — L5: offline tests for telegram_bot/ (escape, formatters, dispatch)
+│   ├── test_exchange.py    — L7: offline tests for exchange/ (72 assertions)
 │   ├── backfill_binance.py — Backfill last 30 days of Binance history (one-shot)
 │   ├── backfill_coinglass.py — Backfill 180 days of CoinGlass aggregated liquidations (one-shot)
 │   ├── backfill_coinglass_oi.py — Backfill 180 days of CoinGlass aggregated OI + funding (one-shot)
@@ -51,7 +59,7 @@ liquidation-bot/
 │   ├── test_liq_analyzer_v2.py — L6b: offline tests for analyze_liq_clusters_v2.py (34 assertions)
 │   ├── test_coinglass_collector.py — L6c: offline tests for coinglass_oi_collector (29 assertions)
 │   └── quick_analysis.py   — Data analysis (run after 2+ days)
-├── state/                  — Paper-bot state (paper_state.json, gitignored)
+├── state/                  — Bot state (paper + showcase, gitignored)
 ├── systemd/                — Service and timer files for VPS
 └── analysis/               — Generated reports (gitignored)
 ```
@@ -225,6 +233,10 @@ All prefixed with `LIQ_`:
 - `LIQ_DB_HOST`, `LIQ_DB_PORT`, `LIQ_DB_NAME`, `LIQ_DB_USER`, `LIQ_DB_PASSWORD`
 - `LIQ_TELEGRAM_BOT_TOKEN`, `LIQ_TELEGRAM_CHAT_ID`
 - `LIQ_COINGLASS_API_KEY` — CoinGlass Hobbyist-tier API key (required for `backfill_coinglass.py`, `backfill_coinglass_oi.py`, and the live `coinglass_oi_collector`)
+- `LIQ_BINANCE_API_KEY` — Binance Futures API key (required for `exchange.scheduler` when `LIQ_DRY_RUN=false`)
+- `LIQ_BINANCE_API_SECRET` — Binance Futures API secret
+- `LIQ_BINANCE_TESTNET` — `true` to use Binance testnet (sandbox mode)
+- `LIQ_DRY_RUN` — `true` (default) to log orders without sending; `false` for real trading
 
 ## Constraints
 
@@ -610,3 +622,97 @@ sudo systemctl list-timers | grep liq
 - Modify `scripts/backfill_coinglass_oi.py` — it's for manual backfills, still needed for initial historical fill.
 - Add CoinGlass liquidations collection here — already handled as side-effect in `bot/signal.py:SignalComputer.fetch_recent_liquidations`.
 - Add new dependencies to requirements.txt.
+
+## Session L7 — BinanceExecutor (Live Trading Infrastructure)
+
+Motivation: L4 paper trading validates the market_flush signal. L7 builds real Binance Futures execution for a showcase lead-trader account. This session only builds and tests infrastructure — actual live launch is L9 after paper results confirm edge.
+
+### Config Inheritance Chain
+
+`collectors.config.Config` → `bot.config.BotConfig` → `exchange.config.ExchangeConfig`
+
+ExchangeConfig adds Binance API credentials, showcase account parameters (15x isolated, $35 margin, TP=5%, SL=3%), stricter conviction filter (z>=2.0, n_coins>=5), circuit breakers, and dry-run control.
+
+### New `exchange/` package (6 modules)
+
+- **`exchange/config.py`** — `ExchangeConfig(BotConfig)`. `@lru_cache` singleton via `get_exchange_config()`. Key fields: `binance_api_key`, `binance_api_secret`, `binance_testnet`, `showcase_capital=500`, `showcase_leverage=15`, `showcase_margin_usd=35.0`, `showcase_max_positions=2`, `showcase_tp_pct=5.0`, `showcase_sl_pct=3.0`, `showcase_z_threshold=2.0`, `showcase_min_coins_flushing=5`, `max_daily_loss_usd=100.0`, `max_consecutive_losses=5`, `max_daily_trades=6`, `dry_run=True`.
+
+- **`exchange/binance_client.py`** — `BinanceClient`: authenticated ccxt wrapper over Binance USDM Futures (perpetual swaps, `defaultType="swap"`). Supports dry-run (synthetic fills from public ticker) and testnet (`set_sandbox_mode`). Key methods: `set_leverage` (idempotent, cached per run via `_configured_symbols`), `get_ticker_price` (public), `open_market_long`, `place_tp_order` (`TAKE_PROFIT_MARKET`, `reduceOnly`, `workingType=MARK_PRICE`), `place_sl_order` (`STOP_MARKET`, same params), `close_market`, `cancel_order` (safe on "not found"), `fetch_order`, `fetch_positions`, `fetch_balance`. All amounts use `amount_to_precision`, all prices use `price_to_precision`.
+
+- **`exchange/safety.py`** — `SafetyGuard`: circuit breakers checked before every entry. Three limits: `max_daily_loss_usd`, `max_consecutive_losses`, `max_daily_trades`. Daily counters reset on UTC rollover; `consecutive_losses` does NOT reset (spans days). `load_from_state(closed_trades)` reconstructs all counters on startup.
+
+- **`exchange/live_executor.py`** — `LiveExecutor`: real order execution with exchange-side TP/SL. State schema extends PaperExecutor with `amount`, `exchange_order_id`, `tp_price`, `sl_price`, `tp_order_id`, `sl_order_id`. Key behaviors:
+  - Entry price = `order["average"]` from market fill (not pre-ticker).
+  - TP/SL amount = `order["filled"]` from fill (not pre-computed).
+  - State persisted IMMEDIATELY after market fill, BEFORE TP/SL placement (crash recovery).
+  - `_close_from_exchange` order: compute P&L → update state → `_save_state()` → `guard.record_trade_result()`.
+  - `check_positions`: batch-fetch exchange positions; for gone positions, explicit TP/SL status disambiguation (both-fired → earlier timestamp wins + alert; neither-fired → reason="manual" + alert; API failure → leave in state, retry next cycle).
+  - `sync_with_exchange`: reconcile state ↔ exchange on startup. Missing from exchange → close as "sync_missing". Unknown exchange position → alert only, never auto-adopt. Re-place TP/SL for unprotected positions found in state.
+  - Same P&L formula as PaperExecutor (`pnl_pct = (exit-entry)/entry*100`, `pnl_usd = pnl_pct/100*notional`).
+
+- **`exchange/scheduler.py`** — Main 4H-aligned loop, mirrors `bot/scheduler.py`. Uses `bot.scheduler.next_wake_ts` (reused, not reimplemented). Conviction filter: `z_threshold_market=1.5` for cross-coin count (unchanged), `showcase_z_threshold=2.0` for per-coin entry (stricter), `showcase_min_coins_flushing=5` (stricter). File lock via `fcntl.flock(LOCK_EX|LOCK_NB)` on state file prevents dual instances. Alerts via `collectors.alerts.send_alert` with custom HTML messages. Run: `python -m exchange.scheduler`.
+
+### Showcase Account Parameters
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Capital | $500 USDT | Fixed |
+| Leverage | 15x isolated | Per-position |
+| Margin/position | $35 USD | Fixed, not % of capital |
+| Max positions | 2 | Simultaneous |
+| TP | 5% unleveraged | = 75% of margin at 15x |
+| SL | 3% unleveraged | = 45% of margin at 15x |
+| Holding timeout | 8h | Same as backtest |
+| Entry z threshold | >= 2.0 | Paper uses >= 1.0 |
+| Min coins flushing | >= 5 | Paper uses >= 4 |
+
+### Circuit Breakers
+
+| Limit | Value | Reset |
+|-------|-------|-------|
+| Max daily loss | $100 | UTC midnight |
+| Max daily trades | 6 | UTC midnight |
+| Max consecutive losses | 5 | On first win (NOT on day rollover) |
+
+### Tests
+
+`scripts/test_exchange.py` — 72 offline assertions, 6 blocks: Config, BinanceClient, LiveExecutor, SafetyGuard, Scheduler integration, LiveExecutor edge cases (both-fired ambiguous, manual close). Run: `.venv/bin/python scripts/test_exchange.py`.
+
+### Deploy (L9, after paper results)
+
+```bash
+# 1. Add to .env on VPS:
+LIQ_BINANCE_API_KEY=...
+LIQ_BINANCE_API_SECRET=...
+LIQ_BINANCE_TESTNET=true    # testnet first
+LIQ_DRY_RUN=true            # dry run first
+
+# 2. Tests
+.venv/bin/python scripts/test_exchange.py
+
+# 3. Dry run
+.venv/bin/python -m exchange.scheduler
+# Check logs: [DRY_RUN] prefixed operations
+
+# 4. Testnet (real orders on testnet)
+# Edit .env: LIQ_DRY_RUN=false, LIQ_BINANCE_TESTNET=true
+sudo cp systemd/liq-showcase-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now liq-showcase-bot.service
+sudo journalctl -u liq-showcase-bot -f
+
+# 5. Live (after 24h testnet observation)
+# Edit .env: LIQ_BINANCE_TESTNET=false
+sudo systemctl restart liq-showcase-bot
+```
+
+### Do NOT
+
+- Change signal definition, thresholds, or coin list in `bot/signal.py` (locked to L3b-2).
+- Close unknown exchange positions automatically — alert only, manual intervention.
+- Use `defaultType: "future"` — must be `"swap"` for USDM perpetuals (all 10 codebase usages confirm).
+- Use pre-ticker price for entry — always use `order["average"]` from actual fill.
+- Use pre-computed amount for TP/SL — always use `order["filled"]` from actual fill.
+- Skip state persist between market fill and TP/SL placement — crash recovery requires it.
+- Guess exit reason on Binance API failure — leave position in state, retry next cycle.
+- Add new dependencies to requirements.txt (ccxt already present).

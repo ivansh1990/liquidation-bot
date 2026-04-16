@@ -9,3 +9,5 @@ __pycache__/
 analysis/report_*.txt
 state/paper_state.json
 state/paper_state.json.tmp
+state/showcase_state.json
+state/showcase_state.json.tmp
