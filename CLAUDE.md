@@ -790,23 +790,14 @@ psql -d liquidation -c "SELECT symbol, COUNT(*), MIN(timestamp), MAX(timestamp) 
 - `min_coins_flushing` = 4
 - Ranking at h=8 (cross-interval comparison)
 
-### CoinGlass h1/h2 support status
+### CoinGlass h1/h2 support status (Startup tier)
 
-Startup tier ($79/mo) unlocks h1/h2 intervals **and** honors `startTime`/`endTime` on `aggregated-history` (unlike Hobbyist which ignores them). This lets `backfill_coinglass_hourly.py` paginate by walking `endTime` backward page-by-page. A one-shot `--coin BTC --verbose` probe at startup confirms this behavior each run and falls back to single-request mode with a loud warning if `endTime` is ever silently downgraded.
+Startup tier ($79/mo) unlocks h1/h2 intervals on `/api/futures/liquidation/aggregated-history` and `/api/futures/open-interest/aggregated-history`. Empirical findings (16 Apr 2026 probe):
 
-Pagination details (in `scripts/backfill_coinglass_hourly.py`):
-- First page: `endTime = now` → latest 1000 bars.
-- Next page: `endTime = oldest_returned_ts − bar_width_s` → older 1000 bars.
-- Stop when any of: response empty; `oldest <= start_ts`; `oldest >= prev_oldest` (API returned the same/newer window — either endTime silently broke or history exhausted); `MAX_PAGES = 10` reached.
-- `REQUEST_SLEEP_S = 2.5s` between pages (well under Startup's 80 req/min cap).
-- `ON CONFLICT (timestamp, symbol) DO NOTHING` tolerates overlap between pages.
-
-Expected pages per (coin, endpoint) at 180 days: h1 ≈ 5, h2 ≈ 3. Full run (10 coins × 2 endpoints × h1 ≈ 100 requests) ≈ 4 min plus two probe requests at startup.
-
-Probe command:
-```bash
-.venv/bin/python scripts/backfill_coinglass_hourly.py --interval h1 --coin BTC --verbose
-```
+- `startTime` and `endTime` parameters are **silently ignored** — server always returns the latest `limit` bars regardless of window parameters. This holds for both aggregated-history and per-exchange `liquidation/history` endpoints. endTime pagination is therefore impossible.
+- `limit` parameter DOES work and the server clamps it to available tier history (~180 days). Tested values on h1: 1000→41d, 3000→125d, 4320→180d, 4500→180d (clamped). This is enough to cover the full Startup-tier window in a single request.
+- Strategy: pass `limit = days × bars_per_day` (h1: 4320, h2: 2160, h4: 1080 for 180 days) and receive full history in one call per coin/endpoint. No pagination needed.
+- Total requests per full backfill: 10 coins × 2 endpoints = 20 requests ≈ 60s including rate-limit sleeps.
 
 ### Walk-forward results
 
@@ -814,11 +805,11 @@ Probe command:
 
 ### Expected data volumes
 
-| Interval | Bars/day | 180 days | Per-page cap | Pages needed | Expected rows |
-|----------|----------|----------|--------------|--------------|---------------|
-| h1 | 24 | 4320 | 1000 | 5 | ~4320 |
-| h2 | 12 | 2160 | 1000 | 3 | ~2160 |
-| h4 | 6 | 1080 | 1000 | 2 | ~1080 (sibling 4H backfill still single-request, ~1000) |
+| Interval | Bars/day | 180 days | Single-request limit | Expected rows |
+|----------|----------|----------|----------------------|---------------|
+| h1 | 24 | 4320 | 4320 | ~4320 |
+| h2 | 12 | 2160 | 2160 | ~2160 |
+| h4 | 6 | 1080 | 1080 | ~1080 (sibling 4H backfill already single-request on Hobbyist) |
 
 ### Do NOT
 
