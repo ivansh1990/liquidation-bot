@@ -820,3 +820,60 @@ Startup tier ($79/mo) unlocks h1/h2 intervals on `/api/futures/liquidation/aggre
 - Run backfill with `--days > 180` (Startup tier limit).
 - Modify `scripts/backtest_liquidation_flush.py` — locked L2 baseline.
 - Add new dependencies to requirements.txt.
+
+## Session L10 Phase 1 — Net Position v2 Data Layer
+
+Motivation: `net_long_change` / `net_short_change` per bar give market positioning flow — how much long/short exposure was added or removed at each bar. Hypothesis to be tested in Phase 2: filtering `market_flush` entries by net position extremes improves win rate without crushing trade frequency (Smart Filter requires ≥14 trading days/30, so reducing entries too aggressively defeats the purpose).
+
+### Endpoint findings (16 Apr 2026, Startup tier)
+
+- URL: `https://open-api-v4.coinglass.com/api/futures/v2/net-position/history`
+- Required params: `exchange` (not `exchange_list`), `symbol` (pair format `BTCUSDT`, not coin `BTC`), `interval`, `limit`.
+- `startTime` / `endTime` silently ignored (same as aggregated-history). `limit` honored up to tier ceiling.
+- `limit=4320` on h1 returns 4320 rows covering 180 days in one request — same pattern as aggregated-history after L8 refactor.
+- PEPE fallback: `PEPEUSDT` → `400 Not Supported`, `1000PEPEUSDT` → works.
+- Response per bar: `time` (ms), `net_long_change`, `net_short_change`, `net_long_change_cum`, `net_short_change_cum`, `net_position_change_cum` — all floats. Units: coin contracts (not USD), but Phase 2 features will normalize to z-scores so units cancel.
+
+### New tables
+
+`coinglass_netposition_h1`, `coinglass_netposition_h2`, `coinglass_netposition_h4` — same schema (timestamp, symbol canonical, exchange, 5 float metrics), `UNIQUE (timestamp, symbol, exchange)` constraint. Created inline by `backfill_coinglass_netposition.py` (no change to `collectors/db.py:SCHEMA_SQL`, matches L8 / L3b-1 pattern).
+
+### Backfill script
+
+`scripts/backfill_coinglass_netposition.py`:
+- Single-request strategy (`limit = days × INTERVAL_BARS_PER_DAY[interval]`), reuses `INTERVAL_BARS_PER_DAY` from `backfill_coinglass_hourly.py`.
+- Hardcoded `exchange="Binance"` in Phase 1; column kept in schema for future multi-exchange expansion without schema migration.
+- Pair mapping: `NETPOS_PAIRS = {coin: f"{coin}USDT"}`, PEPE→1000PEPEUSDT fallback.
+- 10 requests per run, ~25s.
+
+### Run
+
+```bash
+# Tests (offline + optional live smoke)
+.venv/bin/python scripts/test_backfill_netposition.py    # expect PASS: 9 | FAIL: 0
+
+# Backfill all three intervals (10 requests each)
+.venv/bin/python scripts/backfill_coinglass_netposition.py --interval h1 --days 180
+.venv/bin/python scripts/backfill_coinglass_netposition.py --interval h2 --days 180
+.venv/bin/python scripts/backfill_coinglass_netposition.py --interval h4 --days 180
+
+# Verify
+psql -d liquidation -c "SELECT symbol, COUNT(*), MIN(timestamp)::date FROM coinglass_netposition_h1 GROUP BY symbol ORDER BY symbol;"
+```
+
+### Phase 2 / Phase 3 roadmap (NOT in Phase 1 scope)
+
+- **Phase 2:** `scripts/research_netposition.py` — standalone research script that tests two hypotheses across h1/h2/h4:
+  - **H1 Contrarian:** baseline `market_flush` + high `net_short_change` required (logic: shorts pushed price down, then got liquidated, now exhausted).
+  - **H2 Confirmation:** baseline `market_flush` + positive `net_long_change` required (logic: someone already bought the dip, confirms real bottom).
+  - 2 hypotheses × 3 intervals = 6 backtests + baseline sanity.
+  - Output: single report, PASS/FAIL per configuration against L8 criteria (pooled Sharpe > 2.0, Win% > 55%, N ≥ 100, ≥2/3 OOS positive) + extended criteria (trades/day median doesn't drop below 70% of baseline — critical for Smart Filter's 14 trading days/30 requirement).
+- **Phase 3 (conditional on Phase 2 PASS):** If any (hypothesis, interval) PASSes, integrate the winning filter into `bot/signal.py` as an opt-in via config flag. Only PASSing configurations ship to live. Rejected hypotheses documented in this CLAUDE.md section as tested-and-rejected so future sessions don't re-explore.
+
+### Do NOT
+
+- Change locked L3b-2 thresholds (z_self=1.0, z_market=1.5, n_coins≥4) in Phase 1, 2, or 3. Net Position is an **additional filter** on top of baseline, not a replacement.
+- Modify `bot/signal.py`, `bot/paper_executor.py`, or anything in `exchange/` during Phase 1. Data layer only.
+- Add Net Position collection to live 4H/hourly collectors (`coinglass_oi_collector.py`) in Phase 1 — backfill-only until research PASSes.
+- Enable multi-exchange aggregation in Phase 1. Single exchange (Binance) is sufficient for hypothesis testing and keeps volume comparable across metrics already collected from Binance (OI, funding, taker).
+- Extend `--days` above 180 (Startup tier cap).
