@@ -46,6 +46,8 @@ liquidation-bot/
 │   ├── backtest_combo.py   — L3b-2: combo signal backtest (9 combos × 10 coins × 4 holding periods, portfolio + walk-forward)
 │   ├── analyze_liq_clusters.py — L6: liquidation cluster magnet-effect analysis (hit rates + random baseline)
 │   ├── test_liq_analyzer.py — L6: offline tests for analyze_liq_clusters.py (41 assertions)
+│   ├── analyze_liq_clusters_v2.py — L6b: OI-normalized cluster strength analysis (distance × strength matrix)
+│   ├── test_liq_analyzer_v2.py — L6b: offline tests for analyze_liq_clusters_v2.py (34 assertions)
 │   └── quick_analysis.py   — Data analysis (run after 2+ days)
 ├── state/                  — Paper-bot state (paper_state.json, gitignored)
 ├── systemd/                — Service and timer files for VPS
@@ -500,5 +502,64 @@ With ~3 days of 15-min snapshots (13–16 April 2026), expect:
 
 - Add runtime signal modules (bot/liq_targets.py, etc.) — that is L6b, only if PASS.
 - Modify bot/, collectors/, telegram_bot/.
+- Change existing DB tables or add new ones.
+- Add new dependencies to requirements.txt.
+
+## Session L6b — OI-Normalized Cluster Strength Analysis
+
+Motivation: L6 used absolute USD thresholds ($500K–$5M) identically for BTC (OI ~$30B) and WIF (OI ~$100M). A $1M cluster is 1% of WIF's OI but 0.003% of BTC's — the absolute threshold distorts cross-coin comparisons. L6b normalizes cluster volume to Open Interest per coin, creating a `strength_pct = (cluster_usd / oi_usd) * 100` metric, and builds a (distance × strength) hit-rate matrix.
+
+### What changed from v1 to v2
+
+| Aspect | v1 (`analyze_liq_clusters.py`) | v2 (`analyze_liq_clusters_v2.py`) |
+|--------|------|------|
+| Threshold | 4 absolute ($500K–$5M) | 1 floor ($500K) + OI normalization |
+| Strength metric | None (USD only) | `strength_pct = cluster_usd / oi_usd * 100` → weak/medium/strong/mega |
+| Distance buckets | 2% width (0-2%, 2-4%, 4-6%, 6%+) | 1% width (0-1%, 1-2%, ..., 4-5%) |
+| Max distance | Unlimited | 5% (further clusters discarded) |
+| Matrix | Per-threshold flat table | (distance × strength) matrix with random baseline per cell |
+| OI source | None | `coinglass_oi` (preferred, 4H, 167d) → `binance_oi` fallback |
+| PASS criteria | magnet>1.3 + hit>50% + N≥100 | Zone: hit>50% + magnet>1.5 + N≥20 per cell |
+
+### New scripts
+
+- **`scripts/analyze_liq_clusters_v2.py`** — standalone analysis (no new DB tables, no new deps). Imports pure functions from v1 (`build_buckets`, `detect_clusters`, `check_hit`, `compute_hit_rate`, `compute_magnet_score`, `compute_future_extremes`, `load_all_liq_map`, `fetch_klines_1h_ohlc`). New pure functions: `compute_cluster_strength`, `classify_strength`, `fine_distance_bucket_label`, `attach_oi_to_snapshots`, `build_strength_matrix`, `find_algorithmic_zones`.
+
+- **`scripts/test_liq_analyzer_v2.py`** — 34 offline assertions, 8 blocks. Tests: OI normalization, strength classification, fine distance buckets, matrix aggregation, insufficient cell filtering, zone detection, empty OI handling, OI staleness via merge_asof.
+
+### Pure functions (importable from `analyze_liq_clusters_v2`)
+
+| Function | Purpose |
+|----------|---------|
+| `compute_cluster_strength(cluster_usd, oi_usd)` | `(cluster_usd / oi_usd) * 100`, guards zero/NaN OI |
+| `classify_strength(pct)` | Map to "weak" (<0.5%) / "medium" (0.5-2%) / "strong" (2-5%) / "mega" (>5%) |
+| `fine_distance_bucket_label(pct)` | 1%-width buckets: "0-1%"…"4-5%", "" for ≥5% |
+| `attach_oi_to_snapshots(snap_df, oi_df, max_staleness_hours)` | `merge_asof` with 4h tolerance |
+| `build_strength_matrix(results, random_results)` | Group into (distance × strength) cells, compute hit rates + magnet scores |
+| `find_algorithmic_zones(matrix, min_n, min_hit_8h, min_magnet_8h)` | Filter cells meeting all criteria |
+
+### OI data source
+
+`coinglass_oi` (4H interval, created by `backfill_coinglass_oi.py`): `open_interest` field is aggregated USD across exchanges. Attached to each `hl_liquidation_map` snapshot via `pd.merge_asof` with backward direction and 4h tolerance. Snapshots with no OI within tolerance are skipped. Fallback: `binance_oi.open_interest_usd` (hourly, shorter history).
+
+### Run
+
+```bash
+# Tests (TDD — written before implementation)
+.venv/bin/python scripts/test_liq_analyzer_v2.py    # expect PASS: 34 | FAIL: 0
+
+# Analysis (requires DB with hl_liquidation_map + coinglass_oi data + internet for Binance klines)
+.venv/bin/python scripts/analyze_liq_clusters_v2.py | tee analysis/liq_clusters_v2.txt
+```
+
+### Expected outcome with early data
+
+With ~3 days of `hl_liquidation_map` (Apr 13-16) and `coinglass_oi` covering Oct 2025 – Apr 2026, the overlap is only ~3 days. Most matrix cells will have N < 20 → INSUFFICIENT DATA or FAIL. The key value is seeing the pattern in populated cells to determine when enough data will be available. Re-run after 1-2 weeks of collection.
+
+### Do NOT
+
+- Create runtime module `bot/liq_targets.py` — only after PASS verdict.
+- Modify bot/, collectors/, telegram_bot/.
+- Delete `analyze_liq_clusters.py` (v1) — kept for reference.
 - Change existing DB tables or add new ones.
 - Add new dependencies to requirements.txt.
