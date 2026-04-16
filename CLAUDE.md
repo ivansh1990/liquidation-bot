@@ -44,6 +44,8 @@ liquidation-bot/
 │   ├── backtest_h1_with_stops.py — L3: ATR-based TP/SL grid (64 configs/coin) using H1 entries
 │   ├── analyze_heatmap_signal.py — L3: HL heatmap overlay framework (top-decile clusters, preceding-snapshot match)
 │   ├── backtest_combo.py   — L3b-2: combo signal backtest (9 combos × 10 coins × 4 holding periods, portfolio + walk-forward)
+│   ├── analyze_liq_clusters.py — L6: liquidation cluster magnet-effect analysis (hit rates + random baseline)
+│   ├── test_liq_analyzer.py — L6: offline tests for analyze_liq_clusters.py (41 assertions)
 │   └── quick_analysis.py   — Data analysis (run after 2+ days)
 ├── state/                  — Paper-bot state (paper_state.json, gitignored)
 ├── systemd/                — Service and timer files for VPS
@@ -429,3 +431,74 @@ Then in the Telegram chat that matches `LIQ_TELEGRAM_CHAT_ID`:
 - `offset` is in-memory only. After a restart, Telegram may replay up to 24h of buffered commands. For `/status`-style reads this is harmless. If we ever add mutating commands, persist `offset` to disk.
 - On Darwin dev boxes without `systemctl`, `/status` shows systemd state as `unknown` and still renders `active` in the strategy chip (we treat `unknown == active` for display purposes so local dev is readable). On the VPS, `systemctl` is always present.
 - Long-poll means the bot holds one HTTP connection open at all times. If the VPS has a strict NAT timeout < 40s, lower `poll_timeout_s` accordingly.
+
+## Session L6 — LiqMapAnalyzer (Liquidation Cluster Magnet Effect)
+
+Motivation: the `hl_liquidation_map` table (15-min snapshots, ~13 April 2026+) records per-coin liquidation volumes at each price level. Hypothesis: price has a tendency to move TOWARD large liquidation clusters — large SHORT-liq clusters above price attract price upward, large LONG-liq clusters below attract price downward. This session tests the hypothesis offline and emits PASS/FAIL.
+
+### New scripts
+
+- **`scripts/analyze_liq_clusters.py`** — standalone analysis (no new DB tables, no new deps). Steps:
+  0. **Schema exploration**: prints `hl_liquidation_map` columns and per-coin row/snapshot counts.
+  1. **Data loading**: all `hl_liquidation_map` rows + Binance 1H klines (ccxt, public, paginated) per coin. Uses `current_price` from the snapshot as mid-price (no Binance needed for detection-time price). Klines cached per coin.
+  2. **Cluster detection**: for each sampled (snapshot_time, coin) pair, groups price_levels into buckets of width 0.5% of mid_price. Levels above mid → uses `short_liq_usd`, side `"short_liq_above"`. Below → `long_liq_usd`, side `"long_liq_below"`. Buckets whose total USD exceeds a threshold → cluster. Four thresholds tested: $500K, $1M, $2M, $5M.
+  3. **Hit-rate check**: for each cluster, checks whether Binance kline high (for above) or low (for below) reached the cluster's bucket_center within 1h / 4h / 8h / 24h.
+  4. **Random baseline**: for each real cluster, generates a "phantom" at the same distance from mid_price but on the **opposite** side. Compares hit rates → `magnet_score = cluster_hr / random_hr`.
+  5. **Output**: per-threshold tables (cluster count, hit rates, magnet scores), per-coin breakdown at 8h, per-distance breakdown (0-2%, 2-4%, 4-6%, 6%+), and a PASS/FAIL verdict.
+  6. **PASS criteria** (ALL must hold for ≥1 threshold): `magnet_score_8h > 1.3` AND `cluster_hit_rate_8h > 50%` AND `total_clusters >= 100`. If clusters < 100 across all thresholds → `INSUFFICIENT DATA` with projected ready date.
+  7. **Additional analysis** (if PASS and clusters ≥ 200): cluster-size vs hit-rate correlation, average first-hit horizon, recommended runtime parameters.
+  - Sampling: uses every 4th snapshot (configurable via `SNAPSHOT_SAMPLE_INTERVAL`) to manage processing time with dense 15-min data.
+
+- **`scripts/test_liq_analyzer.py`** — 41 offline assertions, 8 blocks. Tests pure functions imported from `analyze_liq_clusters`: `build_buckets`, `detect_clusters`, `check_hit`, `compute_hit_rate`, `compute_magnet_score`, `distance_bucket_label`. No DB/network.
+
+### Pure functions (importable from `analyze_liq_clusters`)
+
+| Function | Purpose |
+|----------|---------|
+| `build_buckets(rows, mid_price, bucket_pct)` | Group price_level rows into side-classified, pct-distance buckets |
+| `detect_clusters(rows, mid_price, threshold, bucket_pct)` | Filter buckets exceeding USD threshold |
+| `check_hit(side, cluster_price, future_highs, future_lows)` | Check if price reached cluster level per horizon |
+| `compute_hit_rate(results, key)` | Aggregate hit percentage |
+| `compute_magnet_score(cluster_hr, random_hr)` | Ratio with zero guard |
+| `distance_bucket_label(pct)` | Map % distance to "0-2%"/"2-4%"/"4-6%"/"6%+" |
+
+### `hl_liquidation_map` schema (confirmed from `collectors/db.py`)
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | BIGSERIAL | PK |
+| snapshot_time | TIMESTAMPTZ | every 15 min |
+| coin | TEXT | canonical name (BTC, ETH, PEPE — not kPEPE) |
+| price_level | DOUBLE PRECISION | rounded to price_step bucket |
+| long_liq_usd | DOUBLE PRECISION | aggregated long liquidation volume at this level |
+| short_liq_usd | DOUBLE PRECISION | aggregated short liquidation volume at this level |
+| num_long_positions | INTEGER | count of long positions at this level |
+| num_short_positions | INTEGER | count of short positions at this level |
+| current_price | DOUBLE PRECISION | mid price at snapshot time (from Hyperliquid allMids) |
+
+Note: `coin` stores **canonical** names (via `canonical_coin()`), not HL names. `analyze_heatmap_signal.py` (L3) queries with `hl_coin()` (kPEPE) but only processes altcoins where the mapping is identity, so this has not been a practical issue.
+
+### Run
+
+```bash
+# Tests (TDD — written before implementation)
+.venv/bin/python scripts/test_liq_analyzer.py    # expect PASS: 41 | FAIL: 0
+
+# Analysis (requires DB with hl_liquidation_map data + internet for Binance klines)
+.venv/bin/python scripts/analyze_liq_clusters.py
+```
+
+### What to expect on first run
+
+With ~3 days of 15-min snapshots (13–16 April 2026), expect:
+- ~280 unique snapshots × 10 coins = ~2800 (snapshot, coin) pairs → ~700 sampled (every 4th).
+- Cluster count depends on the USD threshold and market conditions. At $500K threshold, expect hundreds of clusters. At $5M, possibly tens or fewer.
+- If `INSUFFICIENT DATA`: script prints projected ready date and collection rate.
+- Binance 1H kline fetch takes ~10s per coin (3 days ≈ 72 bars each).
+
+### Do NOT
+
+- Add runtime signal modules (bot/liq_targets.py, etc.) — that is L6b, only if PASS.
+- Modify bot/, collectors/, telegram_bot/.
+- Change existing DB tables or add new ones.
+- Add new dependencies to requirements.txt.
