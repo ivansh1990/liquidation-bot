@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 """
-L8: Download 180 days of 1H/2H liquidation + OI history from CoinGlass.
+L8/L16: Download 1H / 2H / 30m liquidation + OI history from CoinGlass.
 
 Usage:
     .venv/bin/python scripts/backfill_coinglass_hourly.py --interval h1 --days 180
     .venv/bin/python scripts/backfill_coinglass_hourly.py --interval h2 --days 180
+    .venv/bin/python scripts/backfill_coinglass_hourly.py --interval 30m --days 90
     .venv/bin/python scripts/backfill_coinglass_hourly.py --interval h1 --coin BTC --verbose
-    .venv/bin/python scripts/backfill_coinglass_hourly.py --interval h2 --skip-oi
+    .venv/bin/python scripts/backfill_coinglass_hourly.py --interval 30m --skip-oi
 
-Requires: LIQ_COINGLASS_API_KEY in .env (CoinGlass Startup tier for h1/h2).
+Requires: LIQ_COINGLASS_API_KEY in .env (CoinGlass Startup tier for h1/h2/30m).
 Rate limit: 2.5s pause between requests (safe for both Hobbyist 30 req/min
 and Startup 80 req/min tiers).
 
 Idempotent: ON CONFLICT (timestamp, symbol) DO NOTHING on all tables.
 
 Creates tables inline (same pattern as backfill_coinglass.py):
-  - coinglass_liquidations_{h1,h2}  — same schema as coinglass_liquidations
-  - coinglass_oi_{h1,h2}            — same schema as coinglass_oi
+  - coinglass_liquidations_{h1,h2,30m}  — same schema as coinglass_liquidations
+  - coinglass_oi_{h1,h2,30m}            — same schema as coinglass_oi
 
-Strategy (Startup tier, re-probed 16 Apr 2026):
+Strategy (Startup tier, re-probed 16 Apr 2026; 30m re-probed 17 Apr 2026):
   `startTime`/`endTime` are silently ignored by aggregated-history; `limit`
-  IS honored and clamps to ~180 days. So we pass `limit = days × bars_per_day`
-  and fetch the full window in ONE request per (coin, endpoint). 10 coins × 2
-  endpoints = 20 requests total (~60s including rate-limit sleeps).
+  IS honored and clamps to the tier ceiling. We pass `limit = days × bars_per_day`
+  and fetch the full window in ONE request per (coin, endpoint). 30m probe
+  returned 4320 rows (90 days) for a single `limit=4320` request — same
+  single-request pattern as h1/h2. 10 coins × 2 endpoints = 20 requests total
+  (~60s including rate-limit sleeps).
 """
 from __future__ import annotations
 
@@ -64,7 +67,7 @@ CG_BASE_OI = "https://open-api-v4.coinglass.com/api/futures"
 
 # Bars per day for each CoinGlass interval. Used to compute `limit` for
 # single-request full-history backfills on the Startup tier.
-INTERVAL_BARS_PER_DAY = {"h1": 24, "h2": 12, "h4": 6}
+INTERVAL_BARS_PER_DAY = {"30m": 48, "h1": 24, "h2": 12, "h4": 6}
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +330,8 @@ async def main() -> None:
         description="L8: Backfill CoinGlass h1/h2 liquidation + OI history."
     )
     parser.add_argument(
-        "--interval", type=str, required=True, choices=["h1", "h2"],
-        help="CoinGlass interval (h1 or h2).",
+        "--interval", type=str, required=True, choices=["30m", "h1", "h2"],
+        help="CoinGlass interval (30m, h1, or h2).",
     )
     parser.add_argument("--days", type=int, default=180)
     parser.add_argument(

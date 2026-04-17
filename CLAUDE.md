@@ -1662,3 +1662,109 @@ LIQ_SKIP_DB_TESTS=1 .venv/bin/python scripts/test_research_oi.py   # 13 PASS
 - Mark pooled OOS Sharpe > 8.0 as PASS — auto-demoted to MARGINAL for look-ahead review.
 - Ship any PASS/MARGINAL variant to live without completing L15 Phase 2b validation first.
 - Interpret the MDD>100% caveat as a verdict gate — it's a reader-orientation note only. The verdict uses the 20% strict gate.
+
+## Session L16 — `market_flush` Retest at h30m
+
+Motivation: after L15 Phase 2 rejected OI velocity (`4026bb0`), the tested-and-rejected set covers six positioning-adjacent continuous signals. Only `market_flush` at h4 is validated (Sharpe 5.87, 3/3 OOS) but fails Binance Smart Filter adequacy due to clustering (~41 of 148 active calendar days, median 30d trading days ≈ 8 vs the ≥14 gate). L14 Phase 1 proved breadth IS the edge, so the last structural lever untested on the validated strategy is **timeframe**. Hypothesis: clustering at h4 is an aggregation artifact — finer 30-min granularity may expose intraday breadth events and disperse trading days across the calendar while preserving the underlying liquidation-cascade edge.
+
+Scope: single identical-logic timeframe-scaling test. `market_flush` thresholds (`z_self > 1.0`, `z_market > 1.5`, `n_coins ≥ 4`), holding (8h), and coin list locked from L8. Only the bar duration changes (240 min → 30 min).
+
+### Pre-flight CoinGlass 30m probe (2026-04-17)
+
+`GET /api/futures/liquidation/aggregated-history?symbol=BTC&interval=30m&exchange_list=...&limit=4320` → HTTP 200, **4320 rows returned**, range `2026-01-17T16:00:00 → 2026-04-17T15:30:00` (89.98 days). Response shape identical to h1/h2 aggregated-history. Conclusion: single-request `limit = days × 48` works — no pagination code needed. 10 coins × 2 endpoints ≈ 60s with 2.5s rate-limit sleeps.
+
+### `bar_minutes` refactor (U2)
+
+`backtest_market_flush_multitf.py` previously keyed all TF-dependent behavior on integer `bar_hours`. 30m forces `bar_hours = 0.5`. Refactor introduces `bar_minutes` as the canonical internal representation:
+
+- **`INTERVAL_TO_BAR_MINUTES = {"30m": 30, "h1": 60, "h2": 120, "h4": 240}`** — single source of truth.
+- **`_interval_to_bar_minutes(interval)`** — primary helper.
+- **`_interval_to_bar_hours(interval) -> float`** — derived (`bar_minutes / 60.0`). Returns float (0.5 at 30m, 4.0 at h4) — downstream `_z_window` / `_lookback_24h` accept float and cast internally.
+- **`_interval_to_ccxt_timeframe(interval)`** — maps `30m → "30m"`, `h4 → "4h"`. Replaces the old `f"{bar_hours}h"` construction that would produce `"4.0h"` or `"0.5h"`.
+- **`_forward_periods(holding_hours, bar_hours)`** — `max(1, int(round(holding_hours / bar_hours)))`. Replaces `hours // bar_hours` which yielded floats at sub-hour TFs and degraded `pct_change`. Byte-equal at integer bar_hours (existing h4 parity test still passes).
+- **`HOLDING_HOURS_BY_MINUTES`** — new primary dict keyed by bar_minutes: `{30: [4,8,16,48], 60: [4,8,16,48], 120: [8,16,32,48], 240: [4,8,12,24]}`. All include 8h ranking anchor.
+- **`HOLDING_HOURS_MAP`** — backward-compat derived dict keyed by integer bar_hours. Preserved for existing L8/L15 test imports — still works, just omits the sub-hour 30m entry.
+
+The refactor is invisible at h4/h1/h2 (existing tests all pass unchanged, including the 6-assertion byte-for-byte L2 parity block).
+
+### Smart Filter adequacy block (U3) — new functionality in `main()`
+
+Previous L8 verdict reported the 5 primary criteria only. L16 adds the 4 strict Smart Filter gates by consuming the already-reusable helpers in `scripts/smart_filter_adequacy.py`:
+
+- `compute_daily_metrics(trades, date_range)` — per-day pnl / trade_count / equity.
+- `simulate_smart_filter_windows(daily, window_days, ...)` — slides 30/60/90d windows, returns per-window rows with gate outcomes.
+- `summarize_smart_filter_results(window_df, label)` — aggregate pass rates + per-criterion breakdown.
+
+Trade list is built at RANK_HOLDING_HOURS=8h: `exit_ts = entry_ts + 8h`, `pnl_pct = return_8h`. Date range spans the earliest to latest exit date. Strict criteria computed on the 30d window:
+6. `min(trading_days_in_window) >= 14`
+7. `median(trading_days_in_window) >= 14`
+8. `median(win_days_ratio) >= 0.65`
+9. `max(|mdd_in_window_pct|) <= 20%`
+
+### Dual-track verdict ladder
+
+- **PASS** = all 5 primary + all 4 strict met AND pooled Sharpe ≤ 8.0.
+- **MARGINAL** = primary 5 met but strict partially fails, OR pooled Sharpe > 8.0 (auto-demoted for look-ahead review).
+- **FAIL** = any primary criterion missed, or walk-forward skipped (N < `WF_MIN_TRADES`).
+
+Auto-halt: N-aware 100%-win OOS fold guard from `4026bb0` still active.
+
+### Files
+
+- `scripts/backtest_market_flush_multitf.py` — `bar_minutes` refactor + 30m CLI choice + Smart Filter adequacy block + dual-track verdict. h4 / h2 / h1 behavior unchanged (byte-for-byte parity preserved at h4).
+- `scripts/backfill_coinglass_hourly.py` — `--interval` gained `30m` choice; `INTERVAL_BARS_PER_DAY["30m"] = 48`; `ensure_tables` creates `coinglass_liquidations_30m` + `coinglass_oi_30m` inline (same pattern as sibling h1/h2 tables). PEPE → 1000PEPE fallback unchanged. `ON CONFLICT (timestamp, symbol) DO NOTHING` unchanged.
+- `scripts/test_backtest_multitf.py` — +6 assertions across 2 new blocks (`test_30m_scaling`, `test_bar_minutes_consistency`). Total now 40 PASS.
+- **No changes** to `bot/`, `exchange/`, `telegram_bot/`, `collectors/` (incl. `collectors/db.py:SCHEMA_SQL`), or any locked research/validate script. No new dependencies.
+
+### Sample caveat
+
+90 days (2026-01-17 → 2026-04-17) is **half** the L8 180-day sample. Walk-forward 4-fold → ~22 days/fold (vs ~45 for L8). Smart Filter 30d rolling yields ~61 overlapping windows (vs ~151 on 180d). Statistical confidence is materially lower; a borderline PASS should be re-run once the live collector accumulates 180 days of 30m history (~mid-May 2026 at earliest). The driver prints an explicit caveat line when `sample_days < 180`.
+
+### Run
+
+```bash
+# Offline tests
+.venv/bin/python scripts/test_backtest_multitf.py           # expect 40 PASS | 0 FAIL
+
+# h4 parity regression (must match L8 reference within 5%)
+.venv/bin/python scripts/backtest_market_flush_multitf.py --interval h4 \
+    | tee analysis/market_flush_h4_parity_2026-04-17.txt
+
+# 30m single-coin probe (optional)
+.venv/bin/python scripts/backfill_coinglass_hourly.py --interval 30m --days 90 --coin BTC --skip-oi
+
+# 30m full backfill (10 coins, ~60s incl. rate-limit sleeps)
+.venv/bin/python scripts/backfill_coinglass_hourly.py --interval 30m --days 90 \
+    | tee analysis/l16_backfill_log.txt
+
+# SQL sanity
+# psql: SELECT symbol, COUNT(*), MIN(timestamp)::date, MAX(timestamp)::date
+#       FROM coinglass_liquidations_30m GROUP BY symbol ORDER BY symbol;
+# Expect: 10 rows, ~4320 count/symbol, 2026-01-17 → 2026-04-17
+
+# 30m research run
+.venv/bin/python scripts/backtest_market_flush_multitf.py --interval 30m \
+    | tee analysis/market_flush_30m_2026-04-17.txt
+```
+
+### Results
+
+**TBD** — populate after VPS `--interval 30m` run. Report must include: per-coin metrics, pooled walk-forward verdict, Smart Filter adequacy block (30d/60d/90d + strict gate outcomes), sample-adequacy caveat, and final dual-track verdict + recommendation.
+
+### Conditional follow-ups
+
+- **PASS** (all 9 + Sharpe ≤ 8): promote 30m as primary Binance-Smart-Filter-compatible strategy. Plan L17 (integration into `bot/signal.py` as opt-in strategy slot + 14-day paper trade parallel to h4). Update `LIVE_TRADING_MASTER_PLAN.md`. L6b retest demoted to secondary track.
+- **MARGINAL** (primary met, strict partial): document as "promising, needs more data". Extend sample via live 30m collector (new task) + wait 90+ days, OR proceed with L6b as primary path while 30m matures.
+- **FAIL** (any primary): document `market_flush` as timeframe-dependent edge, clustering confirmed fundamental. L6b (April 24) becomes the last research hope before Variant D business-model pivot. Append a row to the tested-and-rejected summary table.
+
+### Do NOT
+
+- Change `market_flush` signal definition, thresholds, holding hours, or coin list. Identical-logic test is the whole premise of L16.
+- Extend to OI / funding / CVD / NetPos on 30m — six structural rejections already exhausted the positioning-signal search space.
+- Deploy live or to showcase on L16 PASS alone. 14-day paper trade is mandatory.
+- Skip the h4 parity regression — the `bar_minutes` refactor must be proven neutral before 30m numbers are trusted. L2 byte-for-byte parity test covers the code path; the VPS h4 run covers the data path.
+- Drop the sample-adequacy caveat — 90-day window is materially shorter than L8's 180-day.
+- Add new dependencies to `requirements.txt` or touch `bot/` / `exchange/` / `telegram_bot/` / `collectors/`.
+- Build a live 30m collector in this session — backfill is sufficient for research; live collection belongs to L17 if PASS.
+- Extend the grid of intervals beyond `{h1, h2, h4, 30m}` without separate ExitPlanMode approval.
+

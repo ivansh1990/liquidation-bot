@@ -403,6 +403,68 @@ def test_z_window_constants():
 
 
 # ---------------------------------------------------------------------------
+# Test 9: 30m scaling (L16)
+# ---------------------------------------------------------------------------
+
+def test_30m_scaling():
+    print("\n--- Test 9: 30m scaling (L16) ---")
+    # L16: sub-hour timeframe. bar_hours = 0.5.
+    z = _z_window(0.5)
+    report("_z_window(0.5) = 720 (15 calendar days at 30m)",
+           z == 720, f"got {z}")
+
+    lb = _lookback_24h(0.5)
+    report("_lookback_24h(0.5) = 48 bars (24h at 30m)",
+           lb == 48, f"got {lb}")
+
+    # 8h holding at 30m = 16 bar forward shift.
+    periods = max(1, int(round(8 / 0.5)))
+    report("8h holding at 30m = 16 bar forward shift",
+           periods == 16, f"got {periods}")
+
+    # HOLDING_HOURS_BY_MINUTES[30] must include the 8h cross-interval ranking anchor.
+    from backtest_market_flush_multitf import HOLDING_HOURS_BY_MINUTES
+    report("HOLDING_HOURS_BY_MINUTES[30] includes 8h ranking anchor",
+           8 in HOLDING_HOURS_BY_MINUTES[30],
+           f"got {HOLDING_HOURS_BY_MINUTES.get(30)}")
+
+
+# ---------------------------------------------------------------------------
+# Test 10: bar_minutes consistency (L16)
+# ---------------------------------------------------------------------------
+
+def test_bar_minutes_consistency():
+    print("\n--- Test 10: bar_minutes consistency (L16) ---")
+    from backtest_market_flush_multitf import (
+        _interval_to_bar_hours,
+        _interval_to_bar_minutes,
+    )
+
+    # bar_hours = bar_minutes / 60.0 consistent across all supported intervals.
+    pairs = {"30m": 0.5, "h1": 1.0, "h2": 2.0, "h4": 4.0}
+    all_hours_ok = all(
+        abs(_interval_to_bar_hours(k) - v) < 1e-9
+        and _interval_to_bar_minutes(k) / 60.0 == v
+        for k, v in pairs.items()
+    )
+    report("bar_hours = bar_minutes/60 consistent across 30m/h1/h2/h4",
+           all_hours_ok, f"pairs={pairs}")
+
+    # 8h holding produces 16/8/4/2 forward-bar shifts at 30m/h1/h2/h4.
+    def _periods(hours: int, bh: float) -> int:
+        return max(1, int(round(hours / bh)))
+    periods_ok = (
+        _periods(8, 0.5) == 16
+        and _periods(8, 1.0) == 8
+        and _periods(8, 2.0) == 4
+        and _periods(8, 4.0) == 2
+    )
+    report("8h holding = 16/8/4/2 bars at 30m/h1/h2/h4",
+           periods_ok,
+           f"got {_periods(8,0.5)}/{_periods(8,1.0)}/{_periods(8,2.0)}/{_periods(8,4.0)}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -415,6 +477,8 @@ def main() -> int:
     test_table_names()
     test_drawdown_scaling()
     test_z_window_constants()
+    test_30m_scaling()
+    test_bar_minutes_consistency()
 
     print()
     print(f"PASS: {passed} | FAIL: {failed}")

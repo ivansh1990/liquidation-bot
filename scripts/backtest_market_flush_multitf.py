@@ -44,18 +44,35 @@ from backtest_combo import (  # noqa: E402
     _try_load_with_pepe_fallback,
 )
 from walkforward_h1_flush import split_folds  # noqa: E402
+from smart_filter_adequacy import (  # noqa: E402  — L16 strict gates
+    SMART_FILTER_CONFIGS,
+    compute_daily_metrics,
+    simulate_smart_filter_windows,
+    summarize_smart_filter_results,
+)
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-# Holding periods in HOURS per interval.  All include 8h for cross-interval
-# ranking.  Values are the number of hours the position is held.
+# Holding periods in HOURS, keyed by bar_minutes. All include 8h for the
+# cross-interval ranking anchor (RANK_HOLDING_HOURS). bar_minutes is the
+# canonical internal TF representation (L16) — sub-hour intervals like 30m
+# cannot be keyed by integer bar_hours. `HOLDING_HOURS_MAP` below is a
+# backward-compat view derived from this dict.
+HOLDING_HOURS_BY_MINUTES: dict[int, list[int]] = {
+    30:  [4, 8, 16, 48],   # h30m: fine-grained, mirrors h1 holding set
+    60:  [4, 8, 16, 48],   # h1
+    120: [8, 16, 32, 48],  # h2
+    240: [4, 8, 12, 24],   # h4: L3b-2 baseline
+}
+
+# Backward-compat dict keyed by integer bar_hours. Omits sub-hour intervals
+# (30m) since they cannot be represented as an integer number of hours.
+# Existing L8/L15 tests import and index this via HOLDING_HOURS_MAP[1/2/4].
 HOLDING_HOURS_MAP: dict[int, list[int]] = {
-    1: [4, 8, 16, 48],     # h1: 4,8,16,48 bars
-    2: [8, 16, 32, 48],    # h2: 4,8,16,24 bars
-    4: [4, 8, 12, 24],     # h4: 1,2,3,6 bars (L3b-2 baseline)
+    m // 60: v for m, v in HOLDING_HOURS_BY_MINUTES.items() if m % 60 == 0
 }
 
 # Z-score window in bars at 4H that equals 15 calendar days.
@@ -83,18 +100,45 @@ ATR_PERIOD: int = 14
 # Interval helpers
 # ---------------------------------------------------------------------------
 
-def _interval_to_bar_hours(interval: str) -> int:
-    return {"h1": 1, "h2": 2, "h4": 4}[interval]
+# Canonical per-interval bar duration in minutes (L16).  Sub-hour intervals
+# force float bar_hours, so bar_minutes is preferred everywhere internally.
+INTERVAL_TO_BAR_MINUTES: dict[str, int] = {
+    "30m": 30, "h1": 60, "h2": 120, "h4": 240,
+}
 
 
-def _z_window(bar_hours: int) -> int:
-    """Scale z-score window to maintain same 15-day calendar window."""
+def _interval_to_bar_minutes(interval: str) -> int:
+    return INTERVAL_TO_BAR_MINUTES[interval]
+
+
+def _interval_to_bar_hours(interval: str) -> float:
+    """Returns a float so 30m → 0.5 resolves cleanly.  Integer intervals
+    still compare correctly (e.g. h4 → 4.0 == 4)."""
+    return INTERVAL_TO_BAR_MINUTES[interval] / 60.0
+
+
+def _interval_to_ccxt_timeframe(interval: str) -> str:
+    """Map internal interval name to ccxt's timeframe string.  ccxt's Binance
+    driver supports '30m', '1h', '2h', '4h' natively."""
+    m = INTERVAL_TO_BAR_MINUTES[interval]
+    return f"{m}m" if m < 60 else f"{m // 60}h"
+
+
+def _z_window(bar_hours: float) -> int:
+    """Scale z-score window to maintain the 15-day calendar window across
+    intervals (h4→90, h2→180, h1→360, 30m→720)."""
     return int(_BASE_Z_WINDOW_4H * 4 / bar_hours)
 
 
-def _lookback_24h(bar_hours: int) -> int:
-    """Number of bars in 24 hours."""
+def _lookback_24h(bar_hours: float) -> int:
+    """Number of bars in 24 hours (h4→6, h2→12, h1→24, 30m→48)."""
     return int(24 / bar_hours)
+
+
+def _forward_periods(holding_hours: int, bar_hours: float) -> int:
+    """Number of forward bars to shift for a holding-period return.  Always
+    returns >= 1 to guard against accidental zero-shift at extreme TFs."""
+    return max(1, int(round(holding_hours / bar_hours)))
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +146,10 @@ def _lookback_24h(bar_hours: int) -> int:
 # ---------------------------------------------------------------------------
 
 def load_liquidations_tf(symbol: str, interval: str) -> pd.DataFrame:
-    """Load CoinGlass liquidations from the interval-specific table."""
+    """Load CoinGlass liquidations from the interval-specific table.
+
+    Naming convention: h4 uses the base table `coinglass_liquidations`;
+    other intervals use `coinglass_liquidations_{interval}` (30m/h1/h2)."""
     table = "coinglass_liquidations" if interval == "h4" else f"coinglass_liquidations_{interval}"
     with get_conn() as conn:
         df = pd.read_sql(
@@ -186,7 +233,7 @@ def fetch_klines_ohlcv(
 def compute_signals_tf(
     liq_df: pd.DataFrame,
     price_df: pd.DataFrame,
-    bar_hours: int,
+    bar_hours: float,
     holding_hours: list[int] | None = None,
 ) -> pd.DataFrame:
     """
@@ -194,11 +241,14 @@ def compute_signals_tf(
     rolling windows and forward returns by bar_hours.
 
     At bar_hours=4 this produces byte-for-byte identical output to the original.
+    bar_hours may be a float (e.g. 0.5 for 30m); forward-return shifts are
+    computed via _forward_periods to ensure integer shift counts.
     """
     z_window = _z_window(bar_hours)
     lookback = _lookback_24h(bar_hours)
     if holding_hours is None:
-        holding_hours = HOLDING_HOURS_MAP.get(bar_hours, [4, 8, 12, 24])
+        bar_minutes = int(round(bar_hours * 60))
+        holding_hours = HOLDING_HOURS_BY_MINUTES.get(bar_minutes, [4, 8, 12, 24])
 
     df = liq_df.copy()
     df = df.set_index("timestamp").sort_index()
@@ -225,11 +275,10 @@ def compute_signals_tf(
     prices = price_df.sort_index()
     df["price"] = prices["price"].reindex(df.index, method="ffill")
 
-    # Forward returns for each holding period.
+    # Forward returns for each holding period.  _forward_periods ensures
+    # integer shifts and handles sub-hour intervals correctly.
     for hours in holding_hours:
-        periods = hours // bar_hours
-        if periods < 1:
-            periods = 1
+        periods = _forward_periods(hours, bar_hours)
         df[f"return_{hours}h"] = df["price"].pct_change(periods).shift(-periods) * 100
 
     return df.dropna(subset=["price"])
@@ -239,7 +288,7 @@ def compute_signals_tf(
 # Feature helpers
 # ---------------------------------------------------------------------------
 
-def _zscore_tf(series: pd.Series, bar_hours: int) -> pd.Series:
+def _zscore_tf(series: pd.Series, bar_hours: float) -> pd.Series:
     window = _z_window(bar_hours)
     return (series - series.rolling(window).mean()) / series.rolling(window).std()
 
@@ -268,17 +317,18 @@ def build_features_tf(
     oi_df: pd.DataFrame,
     funding_df: pd.DataFrame,
     ohlcv_df: pd.DataFrame,
-    bar_hours: int,
+    bar_hours: float,
 ) -> pd.DataFrame:
     """
     Merge all inputs into a feature DataFrame for one coin.
     Mirrors backtest_combo.build_features but scales all period-dependent
-    computations by bar_hours.
+    computations by bar_hours.  bar_hours may be a float (e.g. 0.5 for 30m).
     """
     if liq_df.empty or ohlcv_df.empty:
         return pd.DataFrame()
 
-    holding_hours = HOLDING_HOURS_MAP.get(bar_hours, [4, 8, 12, 24])
+    bar_minutes = int(round(bar_hours * 60))
+    holding_hours = HOLDING_HOURS_BY_MINUTES.get(bar_minutes, [4, 8, 12, 24])
 
     price_df = ohlcv_df[["close"]].rename(columns={"close": "price"})
     df = compute_signals_tf(liq_df, price_df, bar_hours, holding_hours)
@@ -546,17 +596,18 @@ def main() -> None:
         description="L8: Multi-timeframe market_flush backtest."
     )
     parser.add_argument(
-        "--interval", type=str, default="h4", choices=["h1", "h2", "h4"],
-        help="CoinGlass interval (default: h4).",
+        "--interval", type=str, default="h4", choices=["30m", "h1", "h2", "h4"],
+        help="CoinGlass interval (default: h4).  30m is L16.",
     )
     args = parser.parse_args()
 
     interval = args.interval
+    bar_minutes = _interval_to_bar_minutes(interval)
     bar_hours = _interval_to_bar_hours(interval)
-    holding_hours = HOLDING_HOURS_MAP[bar_hours]
+    holding_hours = HOLDING_HOURS_BY_MINUTES[bar_minutes]
     z_window = _z_window(bar_hours)
     lookback = _lookback_24h(bar_hours)
-    timeframe = f"{bar_hours}h"
+    timeframe = _interval_to_ccxt_timeframe(interval)
 
     init_pool(get_config())
 
@@ -762,7 +813,7 @@ def main() -> None:
     c3 = total_n >= 100
     c4 = oos_positive_folds >= 2
     c5 = oos_sharpe is not None and oos_sharpe > 1.0
-    overall = c1 and c2 and c3 and c4 and c5
+    primary_ok = c1 and c2 and c3 and c4 and c5
 
     print(f"  1. Pooled Sharpe > 2.0:       {'PASS' if c1 else 'FAIL'}  ({total_sharpe})")
     print(f"  2. Win rate > 55%:            {'PASS' if c2 else 'FAIL'}  ({total_win_pct:.1f}%)")
@@ -770,10 +821,144 @@ def main() -> None:
     print(f"  4. >= 2/3 OOS folds positive: {'PASS' if c4 else 'FAIL'}  ({oos_positive_folds}/3)")
     print(f"  5. Pooled OOS Sharpe > 1.0:   {'PASS' if c5 else 'FAIL'}  ({oos_sharpe})")
     print()
-    print(f"  Result {interval}: {'PASS' if overall else 'FAIL'}")
+
+    # -----------------------------------------------------------------
+    # L16: Smart Filter adequacy (strict track)
+    # -----------------------------------------------------------------
+    print("=" * 72)
+    print("SMART FILTER ADEQUACY — 30d rolling window (Binance lead-trader)")
+    print("=" * 72)
+
+    # Build per-trade records: exit_ts = entry_ts + 8h, pnl_pct = return_8h.
+    sf_trades: list[dict] = []
+    for df in per_coin_features.values():
+        if df.empty or ret_col not in df.columns:
+            continue
+        mask = apply_combo(df, MARKET_FLUSH_FILTERS)
+        trades_s = df.loc[mask, ret_col].dropna()
+        for ts, r in trades_s.items():
+            sf_trades.append({
+                "exit_ts": ts + pd.Timedelta(hours=RANK_HOLDING_HOURS),
+                "pnl_pct": float(r),
+            })
+
+    strict_verdict_info: dict = {
+        "min_30d_td": None, "median_30d_td": None,
+        "median_30d_win_days": None, "max_30d_mdd_abs": None,
+        "strict_ok": False,
+    }
+    sample_days = 0
+
+    if not sf_trades:
+        print("  No trades — Smart Filter adequacy cannot be computed.")
+    else:
+        min_exit = min(t["exit_ts"] for t in sf_trades)
+        max_exit = max(t["exit_ts"] for t in sf_trades)
+        date_range = pd.date_range(
+            start=min_exit.normalize(), end=max_exit.normalize(),
+            freq="D", tz="UTC",
+        )
+        sample_days = len(date_range)
+        daily = compute_daily_metrics(sf_trades, date_range)
+
+        # Run 30/60/90d windows for diagnostics; strict gates use 30d.
+        sf_30d: pd.DataFrame | None = None
+        for cfg in SMART_FILTER_CONFIGS:
+            wdf = simulate_smart_filter_windows(
+                daily,
+                window_days=cfg["window_days"],
+                min_trading_days=cfg["min_trading_days"],
+                win_days_threshold=cfg["win_days_threshold"],
+                mdd_threshold=cfg["mdd_threshold"],
+            )
+            label = f"{cfg['window_days']}d"
+            summary = summarize_smart_filter_results(wdf, label)
+            if cfg["window_days"] == 30:
+                sf_30d = wdf
+            print(
+                f"  {label:<4} windows: {summary['passed_windows']}/{summary['total_windows']} "
+                f"passed  ({summary['pass_rate_pct']:.1f}%)  "
+                f"[TD={summary['criterion_pass_rates']['trading_days']:.0f}%  "
+                f"PnL+={summary['criterion_pass_rates']['pnl_positive']:.0f}%  "
+                f"Win={summary['criterion_pass_rates']['win_days']:.0f}%  "
+                f"MDD={summary['criterion_pass_rates']['mdd']:.0f}%]"
+            )
+
+        # Strict gates on 30d window.
+        if sf_30d is not None and len(sf_30d) > 0:
+            td = sf_30d["trading_days_in_window"]
+            wr = sf_30d["win_days_ratio"].dropna()
+            mdd = sf_30d["mdd_in_window_pct"].abs()
+            strict_verdict_info.update({
+                "min_30d_td": int(td.min()),
+                "median_30d_td": float(td.median()),
+                "median_30d_win_days": float(wr.median()) if len(wr) else None,
+                "max_30d_mdd_abs": float(mdd.max()),
+            })
+            c6 = strict_verdict_info["min_30d_td"] >= 14
+            c7 = strict_verdict_info["median_30d_td"] >= 14
+            c8 = (
+                strict_verdict_info["median_30d_win_days"] is not None
+                and strict_verdict_info["median_30d_win_days"] >= 0.65
+            )
+            c9 = strict_verdict_info["max_30d_mdd_abs"] <= 20.0
+            strict_verdict_info["strict_ok"] = c6 and c7 and c8 and c9
+            print()
+            print(f"  6. min 30d TD >= 14:          "
+                  f"{'PASS' if c6 else 'FAIL'}  "
+                  f"({strict_verdict_info['min_30d_td']})")
+            print(f"  7. median 30d TD >= 14:       "
+                  f"{'PASS' if c7 else 'FAIL'}  "
+                  f"({strict_verdict_info['median_30d_td']:.1f})")
+            mw = strict_verdict_info["median_30d_win_days"]
+            mw_str = f"{mw:.2f}" if mw is not None else "N/A"
+            print(f"  8. median 30d win-days >= 65%:"
+                  f" {'PASS' if c8 else 'FAIL'}  ({mw_str})")
+            print(f"  9. max 30d |MDD| <= 20%:      "
+                  f"{'PASS' if c9 else 'FAIL'}  "
+                  f"({strict_verdict_info['max_30d_mdd_abs']:.1f}%)")
+        else:
+            print("  Insufficient daily coverage for 30d rolling windows "
+                  "(sample shorter than 30 days after trade exits).")
+
+    # -----------------------------------------------------------------
+    # Sample adequacy + dual-track verdict
+    # -----------------------------------------------------------------
     print()
-    if overall:
-        print(f"  Recommended action: develop {interval} executor (L10)")
+    print(f"  Sample span (trade days): {sample_days}")
+    if 0 < sample_days < 180:
+        print(f"  ⚠️  Sample < 180d (L8 reference) — statistical confidence "
+              f"reduced; borderline PASS should be re-run on extended data.")
+
+    suspicious_sharpe = (
+        total_sharpe is not None and total_sharpe > 8.0
+    )
+    strict_ok = strict_verdict_info["strict_ok"]
+    if suspicious_sharpe:
+        verdict = "MARGINAL"
+        verdict_note = (
+            f"pooled Sharpe {total_sharpe:.2f} > 8.0 suggests look-ahead or "
+            "outlier-driven edge — manual review required"
+        )
+    elif primary_ok and strict_ok:
+        verdict = "PASS"
+        verdict_note = "all 9 criteria met AND pooled Sharpe <= 8.0"
+    elif primary_ok and not strict_ok:
+        verdict = "MARGINAL"
+        verdict_note = "primary 5 met; strict (6-9) partial — Smart Filter adequacy not fully cleared"
+    else:
+        verdict = "FAIL"
+        verdict_note = "one or more primary criteria not met"
+
+    print()
+    print(f"  Result {interval}: {verdict}  — {verdict_note}")
+    print()
+    if verdict == "PASS":
+        print(f"  Recommended action: promote {interval} to paper-trade "
+              "parallel to h4; 14-day paper window before live.")
+    elif verdict == "MARGINAL":
+        print(f"  Recommended action: extend sample / investigate strict gate "
+              "failures before any deployment decision.")
     else:
         print(f"  Recommended action: do NOT deploy {interval} strategy")
 
