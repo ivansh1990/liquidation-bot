@@ -1346,3 +1346,93 @@ Adequacy = `pass_rate_pct >= 60 %` of 30d windows (the primary Smart Filter gate
 - Use Phase 3b's Test 2 verdict as a Smart Filter adequacy substitute — the calendar-day vs trading-day basis is a material difference that penalises sparse strategies unfairly.
 - Raise the adequacy threshold above 60 % without a separate ExitPlanMode approval — the 60 % value is calibrated to leave slack for month-to-month variance while still signalling habitual adequacy.
 - Deploy live on an `H5_ONLY` verdict without manual investigation — h4 failing solo while H5 succeeds solo is an unusual outcome that warrants skeptical review (may indicate a regime shift that invalidates the locked baseline).
+
+## Session L14 Phase 1 — Per-Coin Independent Flush Research
+
+Motivation: L13 Phase 3c exposed a **structural** problem with `market_flush`. Over 148 backtest calendar days the bot traded only 41 of them (28%) because the locked breadth filter `n_coins_flushing >= 4` (with `CROSS_COIN_FLUSH_Z=1.5`) fires all ~10 coins at once when it fires at all — clustering entries into a few days and leaving long stretches silent. Binance Copy Trading Smart Filter requires **≥14 trading days / 30** rolling; our baseline tops out near 13, which is structurally short. Phase 1 tests whether relaxing the breadth threshold K gives temporal dispersion at acceptable Sharpe cost.
+
+### Breadth semantics (clarified)
+
+- `compute_cross_coin_features(..., flush_z=1.5)` computes `n_coins_flushing[t] = count of coins with long_vol_zscore > 1.5` (inclusive of self). Locked.
+- Entry condition stays `long_vol_zscore > 1.0` (L3b-2 locked).
+- The two thresholds differ (1.0 vs 1.5) deliberately — self does not always count toward `n_coins_flushing` when firing.
+- K=0 drops the breadth tuple entirely from the filter list → **truly per-coin independent** (a coin with z ∈ (1.0, 1.5] AND no other coin flushing can now fire).
+- K=1 still requires at least one coin (self or other) to have z > 1.5.
+- K=4 is the locked L3b-2 baseline; K=4 per-interval doubles as the parity check vs L8 reference (h4 Sharpe 5.87 / Win 61.0 / N 428, warn on >5 % drift).
+
+### Matrix
+
+5 breadth values × 3 intervals (h1, h2, h4) = **15 variants**. Per-coin z-score threshold (1.0), cross-coin flush z (1.5), and holding hours (RANK_HOLDING_HOURS=8) stay locked — only K varies.
+
+### Dual-track PASS criteria
+
+**Primary (L8-inherited, Sharpe track):**
+1. Pooled OOS Sharpe > 2.0
+2. Win% > 55 %
+3. N ≥ 100
+4. ≥ 2/3 OOS folds positive
+
+**Strict (Smart Filter adequacy track):**
+5. **Min 30d TD ≥ 14** — every rolling 30-day window must clear the Smart Filter floor (strict minimum).
+6. **Median 30d TD ≥ 14** — the majority of months must clear (stronger, not merely one good month).
+
+### Verdict ladder
+
+| State | Criteria |
+|-------|----------|
+| **STRONG_PASS** | primary (1–4) + strict-5 + strict-6 AND pooled OOS Sharpe ≤ 8.0 |
+| **PASS** | primary + strict-5 (strict-6 fails) AND Sharpe ≤ 8.0 |
+| **MARGINAL** | primary met, strict-5 fails OR pooled OOS Sharpe > 8.0 (look-ahead smell, manual review) |
+| **FAIL** | any primary criterion missed, or walk-forward skipped (N < `WF_MIN_TRADES`) |
+
+Correlation vs h4 baseline, rolling 30-day Sharpe stability, and combined-portfolio synergy are **deferred to an L14 Phase 1b validation** (mirror of L10 Phase 2b / L13 Phase 3b). No PASS/STRONG_PASS variant deploys to live without Phase 1b clearance.
+
+### Files
+
+- **`scripts/research_breadth.py`** — 15-variant research driver. Reuses: `build_features_tf`, `fetch_klines_ohlcv`, `load_liquidations_tf`, `load_oi_tf`, `load_funding`, `RANK_HOLDING_HOURS`, `WF_FOLDS`, `WF_MIN_TRADES`, `CROSS_COIN_FLUSH_Z`, `MARKET_FLUSH_FILTERS`, `_interval_to_bar_hours` (all from `backtest_market_flush_multitf.py`); `compute_cross_coin_features`, `_try_load_with_pepe_fallback` (from `backtest_combo.py`); `run_variant`, `run_walkforward`, `_fmt_num`, `SUSPICIOUS_SHARPE` (from `research_netposition.py`); `extract_trade_records` (from `validate_h1_z15_h2.py`). New pure functions: `build_breadth_filters(K)` (K=0 drops breadth; validates K ∈ [0,10]), `compute_trading_days_distribution(trades, window_days=30)` (unique trading days + rolling 30d window min/median/max/%≥14), `evaluate_breadth_verdict`, `format_variant_block`, `format_final_ranking_with_days` (adds `Min30dTD` / `Med30dTD` columns), `recommend` (ladder-aware message — specifically calls out when K=0 appears only as MARGINAL, since that confirms breadth relaxation doesn't resolve clustering).
+- **`scripts/test_research_breadth.py`** — 13 offline assertions + 1 optional DB smoke. Block 1 (3) filter construction; Block 2 (4) trading-days distribution including empty-list and span<30 edge cases; Block 3 (6) verdict tree covering all paths (FAIL on wf-skipped, STRONG_PASS, PASS-but-not-STRONG, MARGINAL on strict-5 fail, FAIL on primary, MARGINAL on Sharpe > 8 guard).
+
+### Reused data loader
+
+`_load_coins_for_interval` mirrors the pattern in `research_netposition.py` / `research_cvd_standalone.py` minus the hypothesis-specific attach step — breadth research only needs liquidations/OI/funding/klines. Load once per interval; reuse across all 5 K values.
+
+### Run
+
+```bash
+# Offline tests (DB smoke auto-skips)
+.venv/bin/python scripts/test_research_breadth.py       # expect PASS=13 FAIL=0
+
+# Local plumbing sanity (single variant)
+.venv/bin/python scripts/research_breadth.py --intervals h4 --breadth 2
+
+# Full matrix (VPS, architect-triggered, ~15-30 min)
+.venv/bin/python scripts/research_breadth.py | tee analysis/research_breadth_2026-04-17.txt
+```
+
+### Report layout
+
+Per-variant block: variant header with K semantic label → Signal metrics (N, Win%, Sharpe, trades/day) → Walk-forward folds table + Pooled OOS → Trading Days Distribution block (total + calendar span + rolling-window min/median/max + %≥14) → Primary checklist → Strict checklist → suspicious-Sharpe flag if applicable → VERDICT line.
+
+Final ranking sorted by pooled OOS Sharpe descending, columns: `Rank | Variant | N | Win% | Sharpe | OOS | Tr/d | Min30dTD | Med30dTD | Verdict`.
+
+### Recommendation logic
+
+- Any `STRONG_PASS` → Phase 1b validation, then Phase 2 integration candidate. Best (highest pooled OOS Sharpe) goes to paper deploy parallel to h4.
+- `PASS` only (no `STRONG_PASS`) → Paper deploy with caveat that not every month will clear Smart Filter.
+- Only `MARGINAL` variants and **K=0 among them** → breadth relaxation alone does NOT resolve temporal clustering. Escalate to L15 (new orthogonal signal class).
+- Only `MARGINAL` with no K=0 (K=0 was FAIL) → also L15; unusual but same conclusion.
+- All `FAIL` → structural issue confirmed; L15 or L16 pivot.
+
+### Results
+
+**TBD** — to be filled after VPS run.
+
+### Do NOT
+
+- Change locked L3b-2 thresholds (z_self=1.0, CROSS_COIN_FLUSH_Z=1.5). Only K varies in this session.
+- Modify `bot/signal.py`, `bot/paper_executor.py`, anything in `exchange/`, `telegram_bot/`, or `collectors/`. Research-only.
+- Modify any locked script (`backtest_market_flush_multitf.py`, `backtest_combo.py`, `research_netposition.py`, `research_cvd_standalone.py`, `validate_*.py`, `smart_filter_adequacy.py`) — import-only reuse.
+- Add new DB tables or new dependencies to `requirements.txt`.
+- Extend K outside [0, 10] (the validator rejects) — grows overfit risk with no additional signal.
+- Ship any PASS/STRONG_PASS variant to live without completing an L14 Phase 1b validation first (correlation < 0.5 vs h4, rolling 30-day stability, combined-portfolio synergy).
+- Mark pooled OOS Sharpe > 8.0 as STRONG_PASS — auto-demoted to MARGINAL for look-ahead review.
