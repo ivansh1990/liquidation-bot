@@ -252,6 +252,73 @@ All prefixed with `LIQ_`:
 - No Docker
 - No trading/strategy logic — data collection + offline backtesting only
 
+## Tested-and-Rejected Approaches (as of 2026-04-17)
+
+On the 180-day sample 2025-10 → 2026-04 covering 10 coins (BTC, ETH, SOL, DOGE, LINK, AVAX, SUI, ARB, WIF, PEPE) and the Binance Smart Filter goal (≥14 trading days / 30, MDD ≤ 20%, win days ≥ 65%), the following signal approaches have been systematically tested and **REJECTED**. Do not re-explore these without explicit architectural decision documented in LIVE_TRADING_MASTER_PLAN.md.
+
+### Summary table
+
+| # | Approach | Session | Commit | N variants | Verdict | Root cause |
+|---|----------|---------|--------|------------|---------|------------|
+| 1 | NetPos Contrarian/Confirmation (L10) | L10 Phase 1/2/2b | `df5d7ce`, `2987d2c`, `13cc78b` | 18 | REJECT | Correlation 0.76 with h4 `market_flush` — duplicate, not diversification |
+| 2 | CVD as filter over market_flush | L13 Phase 2 | `966db3e` | 18 | REJECT | 18/18 FAIL — CVD extreme events do not coincide with flush events |
+| 3 | CVD standalone H5/H7 | L13 Phase 3/3b/3c | `34387ee`, `644ca18`, `fe2cf8c` | 14 | REJECT | 2 MARGINAL → failed Phase 3c Smart Filter adequacy |
+| 4 | Per-coin breadth relaxation (K<4) | L14 Phase 1 | `e80a5f6` | 15 | REJECT | Inverse tradeoff: edge and temporal dispersion mutually exclusive within market_flush |
+| 5 | Funding rate z-score standalone | L15 Phase 1 | `9accd00` | 6 | REJECT | 6/6 FAIL — H2 showed systematic anti-edge (Sharpe −2.57) in trending regime |
+| 6 | OI velocity z-score standalone | L15 Phase 2 | `cc9e111`, `4026bb0` (guard fix) | 6 | REJECT | 6/6 FAIL — universal Smart Filter adequacy failure; best Sharpe achieved via outlier-driven noise (auto-flagged) |
+
+### Cumulative evidence
+
+**Six rejected continuous-signal approaches** on identical 180-day 2025-10 → 2026-04 sample. Plus the L14 breadth-is-edge finding: breadth was never a filter — it was the core edge, and removing it kills Sharpe while fixing dispersion.
+
+**Strong cumulative conclusion:** no positioning-adjacent continuous signal (funding, OI, netposition, CVD) produces a tradable edge compatible with Smart Filter requirements on this sample in this regime. Both snapshot-contrarian (funding) and velocity-contrarian (OI) hypotheses fail — the 2025-10 → 2026-04 regime does not mean-revert on positioning extremes.
+
+### What this means for future research
+
+- **Do NOT re-test any of rows 1–6 with threshold tweaks, window changes, or coin selection.** Parameter-space has been explored adequately. Further tweaks constitute overfitting to the sample.
+- **Do NOT combine rejected signals into compound filters** without first establishing that each component has independent edge. We tried this with `flush_extreme_funding` (L3b-2) and CVD-filter-over-flush (L13 Phase 2) — both REJECT.
+- **DO consider principally different signal classes:** the untested hypothesis class is **price-targeting** signals (not positioning-based). L6b Predictive Liquidation Magnet is the only active candidate in this class, scheduled for retest April 24, 2026 when HL heatmap data will have ≥ 7 days of history.
+- **DO consider regime-dependence:** all rejections are sample-specific. If market regime shifts to mean-reverting / ranging behavior in 2026-Q3+, some of these approaches may deserve retest with updated data. Flag in future work as "rejected in 2025-10 → 2026-04 trending regime" — not "universally broken."
+
+### Active strategy
+
+Current only validated strategy: **`market_flush` at h4** (z>1.0 + n_coins≥4 breadth, 8h holding). Backtest Sharpe 5.87, 3/3 OOS positive. Documented in L8.
+
+Known limitations of `market_flush`:
+- Clustering (41 active calendar days out of 148) — structurally incompatible with Smart Filter temporal dispersion requirement
+- Breadth filter is the core edge; relaxing it to improve dispersion destroys Sharpe (L14 Phase 1 proof)
+
+Therefore `market_flush` alone is **insufficient** to meet Smart Filter gates for Binance lead-trader. Requires complementary strategy from different class. L6b retest is the current path; if L6b fails, business-model re-evaluation (Variant D) is the fallback.
+
+### Research discipline reminders (learnings integrated)
+
+1. **Dual-track PASS criteria mandatory.** Primary (L8 parity: Sharpe, Win%, N, OOS folds) + Strict (Smart Filter 30d rolling adequacy: min TD, median TD, win days, MDD). Single-track PASS hides catastrophic clustering (L13 Phase 3c lesson).
+2. **Correlation check before calling "diversified."** L10 Phase 2b caught NetPos as 0.76-correlated to h4 — without correlation check, we would have deployed a duplicate.
+3. **Rolling 30d metrics, not aggregates.** Aggregate Sharpe hides temporal distribution. Smart Filter operates on rolling windows, so research must too.
+4. **Win days on trading-days basis, not calendar days.** L13 Phase 3c finding.
+5. **Look-ahead guard must be N-aware.** Fixed April 17, 2026 (`4026bb0`). 100% win rate on small-N OOS folds is sample artifact, not evidence of bug.
+6. **Unit-return MDD can exceed 100%.** Not a bug — cumulative drawdown relative to starting peak. But misleading for deployment risk; always report caveat when MDD > 100%.
+7. **Per-coin z-score normalization essential.** Raw funding/OI/CVD values span 5+ orders of magnitude across coins (PEPE vs BTC); cross-coin comparison impossible without normalization.
+8. **Suspicious Sharpe auto-flag (>8.0 → MARGINAL).** Outlier-driven Sharpe inflation is common in small-N backtests; explicit flag prevents false PASS.
+
+### File-level reference
+
+Tested research drivers (locked, import-only reuse):
+- `scripts/research_netposition.py` — L10
+- `scripts/research_cvd.py`, `scripts/research_cvd_standalone.py` — L13
+- `scripts/research_breadth.py` — L14
+- `scripts/research_funding_standalone.py` — L15 Phase 1
+- `scripts/research_oi_standalone.py` — L15 Phase 2
+
+Shared Smart Filter utilities:
+- `scripts/smart_filter_adequacy.py` — `compute_daily_metrics`, `simulate_smart_filter_windows`, `SMART_FILTER_CONFIGS`
+
+Walk-forward split:
+- `scripts/walkforward_h1_flush.py` — `split_folds`
+
+Look-ahead guard helper (added `4026bb0`):
+- `check_lookahead_guard(folds, min_n)` — present in `research_funding_standalone.py` and `research_oi_standalone.py`; `SUSPICIOUS_WIN_RATE_MIN_N = 30`
+
 ## Session L3 — Walk-forward + ATR stops + heatmap overlay
 
 Three new scripts added, reusing `load_liquidations` / `fetch_klines_4h` / `compute_signals` / `backtest_signal` from `scripts/backtest_liquidation_flush.py` (L2 baseline — do not modify).
