@@ -1509,3 +1509,89 @@ Strict (Smart Filter adequacy on 30d rolling windows):
 - Add a live funding collector — backfill data is sufficient for research; live collection belongs to Phase 3 integration.
 - Ship any PASS/MARGINAL variant to live without completing L15 Phase 1b validation first.
 - Skip the Smart Filter strict gates (criteria 6–9) under any circumstance — they exist specifically because L13 Phase 3c exposed that primary-only verdicts missed structural clustering.
+
+## Session L15 Phase 2 — OI Velocity Z-Score Standalone Research
+
+Motivation: L15 Phase 1 (commit `9accd00`) tested funding rate z-score as a standalone LONG/SHORT signal across 6 variants at h4. **All 6 FAIL.** The damning finding: `H2_z1.5` / `H2_z2.0` showed systematic **anti-edge** (Sharpe −1.85 / −2.57), meaning the classical "negative funding ⇒ shorts crowded ⇒ squeeze up" contrarian assumption is broken on the 2025-10 → 2026-04 sample. Funding measures a positional *snapshot* (who pays whom) — and the snapshot-contrarian hypothesis doesn't survive the current regime.
+
+Phase 2 pivots to **OI velocity** (per-bar `pct_change` of `open_interest`, z-scored per coin over a 15-calendar-day rolling window) as a mechanistically different continuous-signal class. OI measures *positional growth*, not snapshot. A positive OI-velocity spike on a rising price indicates aggressive new longs piling in (over-extension, H1 SHORT); on a falling price, aggressive new shorts (squeeze risk, H2 LONG). Price-direction filter disambiguates long-crowding from short-crowding — this asymmetry vs Phase 1 (where H1/H2 used the sign of funding) is intentional, because OI velocity is magnitude-only.
+
+Phase 2 scope: research only on h4 single timeframe. No changes to `bot/`, `exchange/`, `telegram_bot/`, `collectors/`, `requirements.txt`, or any locked script. h2/h1 extension deferred to a conditional Phase 2b; integration (Phase 3) conditional on Phase 2b validation clearance (mirrors L10 Phase 2b / L13 Phase 3b).
+
+### Hypotheses
+
+- **H1 Contrarian SHORT:** `oi_velocity_zscore > z_oi AND price_change_1 > 0` — aggressive new longs on rising price ⇒ over-extension ⇒ pullback.
+- **H2 Contrarian LONG:** `oi_velocity_zscore > z_oi AND price_change_1 < 0` — aggressive new shorts on falling price ⇒ squeeze.
+
+Both hypotheses require the same upward OI-velocity spike (`> z_oi`); the price-direction filter is what distinguishes which side is crowded. This is asymmetric vs Phase 1.
+
+### Key design decisions
+
+- **Velocity, not level.** Raw `open_interest` spans 5+ orders of magnitude PEPE↔BTC and secular growth (bull market = all OI rising) would dominate a level-based z-score. `pct_change(1)` normalizes per-coin *and* isolates bar-to-bar growth — the mechanism we actually want to measure. `diff()` was considered and rejected for cross-coin scale reasons.
+- **OI is h4-native.** Source table `coinglass_oi_h4` lives on the same 00/04/08/12/16/20 UTC grid as Binance 4H klines — no h8→h4 ffill gymnastics (unlike Phase 1 funding). `load_oi_velocity_features_h4` reindexes onto the ccxt h4 index with ffill purely as a minor-misalignment guard.
+- **Window = 90 h4 bars = 15 calendar days.** Matches L8 convention and Phase 1's 45 h8 bars semantically.
+- **First 90 rows NaN.** `pct_change(1)` introduces a leading NaN; `rolling(window=90, min_periods=90)` requires a full clean window. First valid z-score lands at row 90.
+- **No refactor of Phase 1.** `apply_direction`, `extract_trade_records`, `evaluate_verdict`, `format_variant_block` are duplicated locally (~120 lines). Phase 1 is locked per spec; duplication keeps the lock clean.
+- **MDD caveat line.** Phase 1 `H2_z1.5` reported 553% MDD — correct for unit-return cumulative drawdown against a small peak, but cryptic without context. `format_variant_block` now prints a one-line caveat when `max_abs_mdd > 100%` noting that dollar-sized MDD depends on position sizing. Not a verdict gate — verdict still uses the 20% strict threshold.
+
+### PASS criteria (identical to Phase 1, 9 gates)
+
+Primary (L8 parity):
+1. Pooled OOS Sharpe > 2.0
+2. Win% > 55%
+3. N ≥ 100
+4. ≥ 2/3 OOS folds positive
+5. Pooled OOS Sharpe > 1.0 (formally redundant, kept per spec)
+
+Strict Smart Filter 30d:
+6. Min 30d trading days ≥ 14
+7. Median 30d trading days ≥ 14
+8. Median 30d win-days ratio ≥ 65%
+9. Max 30d |MDD| ≤ 20%
+
+**Verdicts:** PASS = all 9 met AND pooled Sharpe ≤ 8.0. MARGINAL = primary 5 met, strict partial fail OR pooled Sharpe > 8.0 (look-ahead smell). FAIL = any primary fails, or walk-forward skipped (N < 30). Auto-halt: any OOS fold with 100% win rate → halt and print look-ahead warning before ranking output.
+
+### Files
+
+- **`scripts/research_oi_standalone.py`** — 6-variant research driver. New helpers: `compute_oi_velocity_zscore(series, window=90)`, `build_oi_filters(hypothesis, z_oi)` (returns 2-tuple filter list + direction), `load_oi_velocity_features_h4(symbol, h4_index)`, `_oi_loader_wrapper`, `_load_coins_h4` (adds `price_change_1 = price.pct_change(1)` alongside OI features). Local duplicates of Phase 1 helpers: `apply_direction`, `extract_trade_records`, `evaluate_verdict`, `format_variant_block` (Phase-2 variant with MDD>100% caveat branch and OI-semantic description text). Reuses `run_variant`, `run_walkforward`, `format_final_ranking`, `SUSPICIOUS_SHARPE`, `_fmt_num` from `research_netposition.py`; `load_oi_tf`, `fetch_klines_ohlcv`, `WF_FOLDS`, `WF_MIN_TRADES` from `backtest_market_flush_multitf.py`; `compute_daily_metrics`, `simulate_smart_filter_windows`, `summarize_smart_filter_results` from `smart_filter_adequacy.py`; `apply_combo`, `_try_load_with_pepe_fallback` from `backtest_combo.py`.
+- **`scripts/test_research_oi.py`** — 13 offline PASS (Blocks 1–4) + 2 optional DB smoke (Block 5). Block 1 (4): z-score computation (hand-computed match, 90-row cold start, zero-stddev→NaN, default window=90). Block 2 (4): `build_oi_filters` (H1/H2 filter shape + direction, monotonicity z=1.5 ≥ z=2.5, H1/H2 disjoint on non-zero price bars). Block 3 (3): `apply_direction` (long preserves / short inverts / exit−entry = 8h). Block 4 (2): `simulate_smart_filter_windows` column schema + `evaluate_verdict` 4 branches (PASS / MARGINAL / FAIL / suspicious→MARGINAL). Block 5 (optional): `load_oi_velocity_features_h4("BTC", 180d h4 idx)` returns ≥1000 rows with both columns + non-NaN zscore post warm-up; skipped via `LIQ_SKIP_DB_TESTS` or on any connection failure.
+
+### CLI
+
+```
+--hypotheses H1,H2           (default both)
+--thresholds 1.5,2.0,2.5     (default — same grid as Phase 1)
+```
+
+Variant labels: `H1_z2.0_h4`, `H2_z1.5_h4`, etc.
+
+### Run
+
+```bash
+# Offline tests
+LIQ_SKIP_DB_TESTS=1 .venv/bin/python scripts/test_research_oi.py   # 13 PASS
+
+# Single-variant plumbing probe (architect-triggered, requires DB)
+.venv/bin/python scripts/research_oi_standalone.py --hypotheses H1 --thresholds 2.0 | head -80
+
+# Full matrix (VPS, architect-triggered, ~5-10 min)
+.venv/bin/python scripts/research_oi_standalone.py | tee analysis/oi_standalone_2026-04-17.txt
+```
+
+### Expected outcomes
+
+- Any PASS/MARGINAL → **mandatory** L15 Phase 2b validation (correlation < 0.5 vs h4 baseline, rolling 30-day Sharpe stability, combined-portfolio synergy) before Phase 3 integration.
+- All FAIL → document OI velocity as tested-and-rejected alongside Phase 1 funding. Cumulative reject set (NetPos, CVD filter, CVD standalone, funding, OI velocity) is strong evidence that no liquidation/positioning-adjacent continuous signal produces tradable edge on the 2025-10 → 2026-04 sample. Pivot candidates: L11 SHORT research, L6b Predictive Magnet, or re-examine business model.
+- Walk-forward results TBD — to be filled in this section after VPS runs.
+
+### Do NOT
+
+- Change locked L3b-2 thresholds or signal definition (z_self=1.0, z_market=1.5, n_coins≥4). OI velocity is standalone, not a filter over `market_flush`.
+- Modify `bot/signal.py`, `bot/paper_executor.py`, anything in `exchange/`, `telegram_bot/`, or `collectors/`.
+- Modify `scripts/research_funding_standalone.py` (Phase 1 locked), `backtest_market_flush_multitf.py` (L8 locked), or any other sibling research/validate/backfill script — import-only reuse.
+- Add new DB tables, new dependencies to `requirements.txt`, or a live OI-change collector (backfill data is sufficient).
+- Extend the threshold grid beyond {1.5, 2.0, 2.5} without separate ExitPlanMode approval — overfit risk grows quadratically.
+- Test h2/h1 in Phase 2 — deferred to Phase 2b, conditional on any h4 PASS.
+- Mark pooled OOS Sharpe > 8.0 as PASS — auto-demoted to MARGINAL for look-ahead review.
+- Ship any PASS/MARGINAL variant to live without completing L15 Phase 2b validation first.
+- Interpret the MDD>100% caveat as a verdict gate — it's a reader-orientation note only. The verdict uses the 20% strict gate.
