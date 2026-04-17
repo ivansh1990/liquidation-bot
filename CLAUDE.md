@@ -1436,3 +1436,76 @@ Final ranking sorted by pooled OOS Sharpe descending, columns: `Rank | Variant |
 - Extend K outside [0, 10] (the validator rejects) — grows overfit risk with no additional signal.
 - Ship any PASS/STRONG_PASS variant to live without completing an L14 Phase 1b validation first (correlation < 0.5 vs h4, rolling 30-day stability, combined-portfolio synergy).
 - Mark pooled OOS Sharpe > 8.0 as STRONG_PASS — auto-demoted to MARGINAL for look-ahead review.
+
+## Session L15 Phase 1 — Funding Rate Z-Score Standalone Research
+
+Motivation: L14 Phase 1 proved `market_flush` architecturally unsuitable for Binance Smart Filter — clustering (41 active calendar days / 148) and breadth dependency are mutually exclusive (K=0 at h4 reached Min30dTD=15 but Sharpe collapsed to 0.71). All prior L-sessions (L10 NetPos, L13 CVD Phase 2/3/3b/3c, L14 breadth) share a liquidation-based clustering substrate. L15 pivots to a **continuous-by-design** signal class: funding rate extremes. Funding updates every 8h on every coin by construction — the temporal dispersion needed for Smart Filter's ≥14 trading days / 30 is built in. Funding also carries orthogonal information (crowded positioning) vs liquidation cascades (forced exits), so low correlation with the h4 baseline is implied by construction.
+
+Phase 1 scope: **research only** on h4 single timeframe. No changes to `bot/`, `exchange/`, `telegram_bot/`, `collectors/`, `requirements.txt`, or any locked script. h2/h1 extension deferred to Phase 2 conditional on any h4 PASS. Integration (Phase 3) conditional on a Phase 1b validation pass (correlation < 0.5, rolling 30-day stability, combined-portfolio synergy — mirrors L10 Phase 2b / L13 Phase 3b).
+
+### Hypotheses
+
+- **H1 Contrarian SHORT:** `funding_zscore > z_fund` → SHORT entry (longs paying shorts heavily → crowded longs → expect flush down).
+- **H2 Contrarian LONG:** `funding_zscore < -z_fund` → LONG entry (shorts paying longs heavily → crowded shorts → expect squeeze up).
+
+H1 is the first SHORT variant tested in L-series research. Phase 1 accepts SHORT as a deliberate scope expansion — funding crowding naturally has symmetric directions and testing only LONG would half-truth the signal. Execution-side SHORT work (order sizing, liquidation buffers, borrow-fee accounting) still belongs to a future L11 session.
+
+### Key design decisions
+
+- **Z-score on h8 source, not h4-ffilled.** A 45-bar rolling window applied to the h8 funding series equals exactly 15 calendar days (3 bars/day × 15 days). Applying the same window on the h4-ffilled series would double-count each funding value and give a mathematically different mean/std. Implementation: `compute_funding_zscore(series, window=45)` runs on h8; `load_funding_features_h4(symbol, h4_index)` computes zscore at h8 then ffills both `funding_rate` and `funding_zscore` to h4.
+- **Direction flipping via `return_{h}h` column.** SHORT entries need returns inverted for Sharpe/Win% to come out direction-consistent. Rather than writing parallel `_run_funding_variant` / `_run_funding_walkforward` helpers (as originally planned), the implementation re-uses `run_variant` / `run_walkforward` from `research_netposition.py` by pre-flipping the `return_8h` column per variant via `apply_direction(df, direction)`. Less new code, zero behavior change in the reused helpers.
+- **Fixed 8h holding at h4.** Matches L3b-2 convention. Shorter holdings tested in prior L-sessions didn't improve — 8h is the cross-interval ranking anchor.
+- **Baseline REF row is nominal only.** Funding is a new signal class, not a filter on `market_flush`. The REF row in the final ranking carries only the raw trading-grid stats (total rows across coins) so downstream readers can sanity-check coverage. It does NOT run `MARKET_FLUSH_FILTERS` — cross-signal-class baselines would be misleading here.
+- **100%-win OOS fold halts the script.** Look-ahead guard — no pooled metrics should be trusted if any OOS fold reports a clean 100% win rate.
+
+### PASS criteria (dual-track)
+
+Primary (L8 parity, all must hold):
+1. Pooled OOS Sharpe > 2.0
+2. Win% > 55
+3. N ≥ 100
+4. ≥ 2/3 OOS folds positive
+5. Pooled OOS Sharpe > 1.0 (formally redundant, kept per spec convention)
+
+Strict (Smart Filter adequacy on 30d rolling windows):
+6. Min 30d trading days ≥ 14
+7. Median 30d trading days ≥ 14
+8. Median 30d win days ratio ≥ 65%
+9. Max 30d absolute MDD ≤ 20%
+
+**Verdicts:** PASS = all 9 met AND pooled OOS Sharpe ≤ 8.0. MARGINAL = primary 5 met but strict (6–9) partially failed, OR pooled OOS Sharpe > 8.0. FAIL = any primary criterion missed, or walk-forward skipped (N < `WF_MIN_TRADES`).
+
+### Files
+
+- **`scripts/research_funding_standalone.py`** — 6-variant driver. Pure functions: `compute_funding_zscore`, `build_funding_filters`, `apply_direction`, `extract_trade_records`, `evaluate_verdict`. Data loaders: `load_funding_features_h4`, `_load_coins_h4`. Reuses `run_variant` / `run_walkforward` / `format_final_ranking` / `_fmt_num` / `SUSPICIOUS_SHARPE` from `research_netposition.py`; `compute_daily_metrics` / `simulate_smart_filter_windows` / `summarize_smart_filter_results` from `smart_filter_adequacy.py`; `apply_combo` / `_try_load_with_pepe_fallback` from `backtest_combo.py`; `load_funding` / `fetch_klines_ohlcv` / `WF_FOLDS` / `WF_MIN_TRADES` from `backtest_market_flush_multitf.py`.
+- **`scripts/test_research_funding.py`** — 13 offline PASS (Blocks 1–4) + 2 optional DB-smoke (Block 5). Block 1 z-score computation (4); Block 2 hypothesis filter + monotonicity (4); Block 3 direction-adjusted trade extraction (3); Block 4 Smart Filter integration + verdict ladder (2).
+
+### Run
+
+```bash
+# Offline tests (DB smoke auto-skips via LIQ_SKIP_DB_TESTS)
+.venv/bin/python scripts/test_research_funding.py    # expect PASS: 13 | FAIL: 0
+
+# Debug slice (single variant, local DB required)
+.venv/bin/python scripts/research_funding_standalone.py --hypotheses H1 --thresholds 2.0
+
+# Full matrix (VPS, architect-triggered, ~5-10 min)
+.venv/bin/python scripts/research_funding_standalone.py | tee analysis/funding_standalone_2026-04-17.txt
+```
+
+### Phase 2 roadmap (conditional)
+
+- Any h4 PASS → Phase 2: same 6-variant matrix on h2 and h1 to surface additional trading timeframes. Funding is h8, so h2/h1 just resolve the entry-timing lottery — expect similar signal shape, possibly more trades/day.
+- Any h4 PASS → mandatory **L15 Phase 1b validation** (correlation < 0.5 vs h4 baseline, rolling 30-day stability, combined-portfolio synergy) before Phase 3 integration into `bot/signal.py`.
+- All h4 FAIL → document as tested-and-rejected and proceed to L15 Phase 2 alternative (OI z-score — another continuous signal class).
+
+### Do NOT
+
+- Change `market_flush` signal, locked L3b-2 thresholds, `bot/signal.py`, `bot/paper_executor.py`, or anything in `exchange/` / `telegram_bot/` / `collectors/` — research only.
+- Reuse the `flush_extreme_funding` combo logic from L3b-2 — that was filter-over-`market_flush` (already rejected). L15 tests funding as standalone.
+- Test on h1/h2 in Phase 1 — funding is h8, finer timeframe just duplicates signal resolution without edge benefit.
+- Extend the z-threshold grid beyond 1.5 / 2.0 / 2.5 without a separate ExitPlanMode approval (overfit risk grows quadratically).
+- Mark pooled OOS Sharpe > 8.0 as PASS — auto-demoted to MARGINAL for look-ahead review.
+- Add a live funding collector — backfill data is sufficient for research; live collection belongs to Phase 3 integration.
+- Ship any PASS/MARGINAL variant to live without completing L15 Phase 1b validation first.
+- Skip the Smart Filter strict gates (criteria 6–9) under any circumstance — they exist specifically because L13 Phase 3c exposed that primary-only verdicts missed structural clustering.
