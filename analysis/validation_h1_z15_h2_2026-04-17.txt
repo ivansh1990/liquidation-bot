@@ -1,0 +1,99 @@
+Loading h4 coin dataframes ...
+  BTC  : rows=1016  netpos_coverage=91%
+  ETH  : rows=1016  netpos_coverage=91%
+  SOL  : rows=1016  netpos_coverage=91%
+  DOGE : rows=1016  netpos_coverage=91%
+  LINK : rows=1016  netpos_coverage=91%
+  AVAX : rows=1016  netpos_coverage=91%
+  SUI  : rows=1016  netpos_coverage=91%
+  ARB  : rows=1016  netpos_coverage=91%
+  WIF  : rows=1016  netpos_coverage=91%
+  PEPE : rows=1016  netpos_coverage=91%
+
+Loading h2 coin dataframes ...
+  BTC  : rows=2160  netpos_coverage=91%
+  ETH  : rows=2160  netpos_coverage=91%
+  SOL  : rows=2160  netpos_coverage=91%
+  DOGE : rows=2160  netpos_coverage=91%
+  LINK : rows=2160  netpos_coverage=91%
+  AVAX : rows=2160  netpos_coverage=91%
+  SUI  : rows=2160  netpos_coverage=91%
+  ARB  : rows=2160  netpos_coverage=91%
+  WIF  : rows=2160  netpos_coverage=91%
+  PEPE : rows=2160  netpos_coverage=91%
+
+===================================================================
+L10 PHASE 2B — H1_z1.5_h2 VALIDATION REPORT
+===================================================================
+
+STRATEGIES:
+  h4 baseline:   N=428  Win%=61.00  pooled Sharpe=5.87
+  H1_z1.5_h2:    N=296  Win%=56.10  pooled Sharpe=4.17
+
+-------------------------------------------------------------------
+TEST 1: DAILY RETURN CORRELATION
+-------------------------------------------------------------------
+  Pearson correlation (h4 vs h2):   0.7643
+  Active days h4:     25.0% of 164 days
+  Active days h2:     30.5%
+  Both active days:   20.1%
+  Overlap breakdown on common active days:
+    Both winning:        51.5%
+    Both losing:         36.4%
+    h4 win, h2 lose:     9.1%  <- diversification
+    h4 lose, h2 win:     3.0%  <- diversification
+
+  PASS criteria:
+    [FAIL] correlation < 0.5   (0.7643)
+    [FAIL] mixed days >= 15%    (12.1%)
+
+  VERDICT TEST 1: FAIL
+
+-------------------------------------------------------------------
+TEST 2: ROLLING 30-DAY SHARPE STABILITY
+-------------------------------------------------------------------
+  [h4 baseline] used=116/135 windows  (skipped low-activity=19, zero-std=0)
+    Low-activity drop:    14.1%
+    Min rolling Sharpe:   -1.20
+    P05 / Median / P95:   -0.71 / 1.88 / 3.70
+    Max:                  4.95
+    % windows Sharpe > 2: 43.1%
+    % windows win days >= 65%: 69.8%
+
+  [H1_z1.5_h2] used=135/135 windows  (skipped low-activity=0, zero-std=0)
+    Low-activity drop:    0.0%
+    Min rolling Sharpe:   -2.96
+    P05 / Median / P95:   -2.96 / 1.77 / 5.61
+    Max:                  7.86
+    % windows Sharpe > 2: 47.4%
+    % windows win days >= 65%: 43.0%
+
+  PASS criteria (each strategy):
+    min > 0  AND  median > 2.0  AND  >= 60% windows Sharpe > 2  AND
+    >= 50% windows win days >= 65%
+
+  VERDICT TEST 2 (h4): FAIL
+  VERDICT TEST 2 (h2): FAIL
+
+-------------------------------------------------------------------
+TEST 3: COMBINED PORTFOLIO (50/50)
+-------------------------------------------------------------------
+  Combined Sharpe:      +1.737   (h4 solo: +1.785, h2 solo: +1.402)
+  Combined MDD:         -643.94 USD   (h4 solo: -694.29, h2 solo: -593.58)
+  Combined win days:    67.2%   (h4 solo: 65.9%, h2 solo: 60.0%)
+  Combined trades/day:  0.354   (h4: 0.250, h2: 0.305)
+
+  PASS criteria:
+    [FAIL] combined Sharpe > max(h4, h2)  (1.737 vs 1.785)
+    [OK] combined MDD less severe than h4 solo
+    [OK] combined win days >= h4 solo
+
+  VERDICT TEST 3: FAIL
+
+===================================================================
+OVERALL RECOMMENDATION
+===================================================================
+  -> ALARM
+
+  Reasoning: h4 baseline fails rolling 30-day Sharpe stability test. Even the locked production signal cannot consistently satisfy Smart Filter conditions in a rolling window. Pause Phase 3 and re-examine the baseline before layering additional filters.
+===================================================================
