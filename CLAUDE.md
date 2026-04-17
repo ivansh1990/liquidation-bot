@@ -1229,3 +1229,56 @@ Correlation vs h4 baseline < 0.5, rolling 30-day Sharpe stability, and combined-
 - Extend the threshold grid beyond the 3 defaults per hypothesis without a separate ExitPlanMode approval (overfit risk grows quadratically).
 - Mark pooled OOS Sharpe > 8.0 as PASS without manual inspection — auto-demoted to MARGINAL.
 - Ship any PASS/MARGINAL variant to live without completing L13 Phase 3b validation first.
+
+## Session L13 Phase 3b — H5_z2.5_h2 Validation
+
+Motivation: L13 Phase 3 produced exactly one **qualified MARGINAL** — **H5_z2.5_h2** (Aggressive Selling Exhaustion on h2): N=137, Win% 56.2, pooled OOS Sharpe 6.20, **3/3 OOS folds positive** (unique property across all L13 research), OOS3 Sharpe +3.82 (works in the freshest window), fold pattern monotone (7.18 → 6.30 → 3.82, no OOS2 outlier). Failed only on the strict `trades/day ≥ 1.5` absolute floor (got 0.77 ≈ 23 trades/month — still enough for Smart Filter's 14 trading days / 30 when evenly distributed). Pooled 3-fold aggregates alone are insufficient to decide deploy-vs-reject; three questions remain unresolved and are resolved here the same way L10 Phase 2b resolved them for H1_z1.5_h2.
+
+### Three validation tests
+
+**Test 1 — Daily-return correlation (diversification):** Pearson correlation between per-day pnl series plus 4-way overlap breakdown (both_win / both_lose / h4_win_h5_lose / h4_lose_h5_win) on common active days. PASS = `corr < 0.5` AND `mixed_pct ≥ 15%`. Low correlation is implied by construction (H5 fires on CVD extremes, baseline fires on flush — Phase 2 showed these rarely overlap) but the test quantifies it.
+
+**Test 2 — Rolling 30-day Sharpe stability (per strategy, h4 + h5 each):** Slide a 30-day window across each strategy's daily pnl series (reuses `compute_rolling_sharpe_test` from `validate_h1_z15_h2.py` — `STD_EPS=1e-12`, `min_trading_days=5`, drop-rate warning when >30%). PASS (each strategy) = `min > 0` AND `median > 2.0` AND `≥60%` windows with Sharpe > 2 AND `≥50%` windows with win-days ≥ 65%.
+
+**Test 3 — Combined 50/50 portfolio synergy:** `combined_usd = 0.5 × capital × h4_pct/100 + 0.5 × capital × h5_pct/100`; equity curve → running-max → drawdown → MDD. PASS = `combined_sharpe > max(h4_solo, h5_solo)` AND `combined_mdd > h4_solo_mdd` (less severe — both are ≤ 0) AND `combined_win_days ≥ h4_solo_win_days`. Strict dominance over h4 solo is required — no slot for a partner that does not strictly improve the baseline portfolio.
+
+### Recommendation tree
+
+| Condition | Verdict | Next action |
+|---|---|---|
+| Test 2 (h4) FAIL | `ALARM` | Pause Phase 3b; reinvestigate baseline rolling stability |
+| Test 1 FAIL or Test 3 FAIL | `REJECT` | Skip to L11 SHORT-side research |
+| Tests 1 + 3 PASS, Test 2 (h5) PASS | `STRONG_GO` | Phase 4 integration + paper deploy parallel to h4 |
+| Tests 1 + 3 PASS, Test 2 (h5) FAIL | `WEAK_GO` | Paper trading parallel to h4, min 30 days; no live until stable |
+
+### Files
+
+- **`scripts/validate_h5_z25_h2.py`** — standalone validator. Thin-reuse of `validate_h1_z15_h2.py` helpers (all module-level importable, no refactor): `extract_trade_records`, `aggregate_daily_pnl`, `compute_correlation_test`, `compute_rolling_sharpe_test`, `compute_combined_portfolio_test`, `STD_EPS`, `DEFAULT_CAPITAL_USD`, `TRADING_DAYS_PER_YEAR`. Other imports: `_load_coins_for_interval` and `build_hypothesis_filters` from `research_cvd_standalone.py` (the CVD-standalone loader — includes `attach_cvd + build_exhaustion_features + build_divergence_features`; **do NOT import the homonym from `research_netposition.py` — it lacks CVD columns H5 needs**), `run_variant` from `research_netposition.py`, `MARKET_FLUSH_FILTERS` + `RANK_HOLDING_HOURS` from `backtest_market_flush_multitf.py`. New helpers: `run_h4_baseline()`, `run_h5_z25_h2()`, `recommend()`, `format_report()`, `_strategy_stats_from_trades()`.
+- **`scripts/test_validate_h5_z25_h2.py`** — 7 required PASS (+1 optional DB smoke). Block 1 (3) = imports + H5 filter shape + `format_report` smoke; Block 2 (4) = `recommend()` verdict tree branches (ALARM / STRONG_GO / WEAK_GO / REJECT); Block 3 (optional) = live DB smoke that skips without a reachable DB. Logic-level coverage of the reused helpers is already in `test_validate_h1_z15_h2.py` (14 PASS) — duplicating it here would be dead weight.
+
+### Parity risk
+
+`extract_trade_records` replicates `run_variant`'s internal `apply_combo` mask to recover per-trade metadata (`run_variant` returns only pooled aggregates). If the replicated mask ever drifts from `run_variant`'s internal path, pooled `(N, Win%, Sharpe)` will diverge between the `run_variant` summary and the extracted-trade-list summary. The report prints both numbers side-by-side so drift is visible — same safeguard used in `validate_h1_z15_h2.py`.
+
+### Run
+
+```bash
+# Offline tests (DB smoke auto-skips)
+.venv/bin/python scripts/test_validate_h5_z25_h2.py    # expect 7 PASS (8 with DB)
+
+# Validation run (VPS with populated DB, ~5-10 min)
+.venv/bin/python scripts/validate_h5_z25_h2.py | tee analysis/validation_h5_z25_h2_2026-04-17.txt
+```
+
+### Key reuse note (`h2_solo_*` naming)
+
+`compute_combined_portfolio_test` returns the partner strategy's metrics under keys prefixed `h2_solo_*` — the helper was authored for L10 Phase 2b where the partner was an h2-interval strategy. Phase 3b re-uses the helper verbatim; `format_report` reads `h2_solo_sharpe / h2_solo_mdd / h2_solo_win_days / h2_solo_trades_per_day` and renders them as the h5 strategy's metrics. If you change the helper's return keys, both validators break.
+
+### Do NOT
+
+- Modify `scripts/validate_h1_z15_h2.py`, `scripts/research_cvd_standalone.py`, `scripts/research_netposition.py`, or `scripts/backtest_market_flush_multitf.py` — import-only.
+- Change `bot/`, `exchange/`, `telegram_bot/`, or `collectors/` — research-only session.
+- Add new DB tables or new deps (`requirements.txt` unchanged).
+- Ship to live on `WEAK_GO` without paper trading. Paper is mandatory.
+- Interpret Test 3 MDD sign backwards — both MDDs are ≤ 0, and "less severe" = "greater" (closer to zero).
+- Import `_load_coins_for_interval` from `research_netposition.py` for H5 — it does not attach CVD features and H5 filters will silently produce 0 trades.
