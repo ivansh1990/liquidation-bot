@@ -1151,3 +1151,81 @@ Correlation vs h4 baseline < 0.5, rolling 30-day Sharpe stability, and combined-
 - Mark Sharpe > 8.0 as PASS without manual inspection.
 - Ship any PASS/MARGINAL variant to live without completing L13 Phase 2b validation first.
 - Re-add the `1000PEPE` fallback for CVD — Phase 1 confirmed canonical `PEPE` stored; fallback is no-op + log clutter.
+
+## Session L13 Phase 3 — CVD Standalone Research
+
+Motivation: L13 Phase 2 (commit `966db3e`) showed CVD **as a filter** over `market_flush` = all variants FAIL — 96-100 % of baseline trades filtered out because flush moments and CVD extremes rarely overlap. The silver lining: CVD carries **orthogonal information** from the liquidation-flush substrate. Phase 3 reframes CVD as a **standalone LONG signal** rather than a filter. Because standalone entries fire at completely different moments than the baseline, low correlation with h4 baseline is implied by construction — directly addressing the L10 Phase 2b ALARM (H1_z1.5_h2 corr=0.76 with h4 baseline).
+
+Scope: LONG only. SHORT stays for L11. Phase 3 is research-only — no changes to `bot/`, `exchange/`, `telegram_bot/`, `collectors/`, or `requirements.txt`. Integration (Phase 4) conditional on a passing L13 Phase 3b validation (separate session).
+
+### Hypotheses
+
+- **H5 — Aggressive Selling Exhaustion (LONG):** `per_bar_delta_zscore < -threshold AND consecutive_negative_delta_bars >= 3`. Thresholds: `1.5, 2.0, 2.5`. Semantics: 3+ consecutive bars of net aggressive selling ⇒ seller exhaustion ⇒ reversion up.
+- **H7 — Price-CVD Divergence (LONG):** `price_change_6bars < 0 AND cum_delta_change_zscore > threshold`. Thresholds: `0.5, 1.0, 1.5` (normalized per-coin z-score on 15-calendar-day rolling stddev of `cum_vol_delta.diff(6)`). Semantics: price fell over 6 bars while aggressive-buy flow rose over same window ⇒ smart-money absorption ⇒ reversion up.
+
+Matrix: 2 hypotheses × 3 thresholds × 3 timeframes = 18 variants + 3 baseline context rows (one per interval, labelled `REF`, no PASS/FAIL).
+
+### PASS criteria (all 8 must hold — strengthened after Phase 2b ALARM and Phase 2 CVD-filter reject)
+
+Primary (L8-inherited):
+1. Pooled OOS Sharpe > 2.0
+2. Win% > 55
+3. N ≥ 100
+4. ≥ 2/3 OOS folds positive
+5. Pooled OOS Sharpe > 1.0 (formally redundant, kept per convention)
+
+Strict (new):
+6. **OOS3 (last fold) Sharpe > 0** — freshest period must earn, not just pooled average.
+7. **|max_OOS_Sharpe / min_OOS_Sharpe| < 5** when `min < 0` — outlier-fold guard. When all OOS folds > 0, ratio set to `1.0` (sentinel "no concern").
+8. **trades/day ≥ 1.5** absolute floor (not relative to baseline — Smart Filter wants 14 trading days / 30, and we want margin above the 0.5/day floor).
+
+Verdicts:
+- **PASS** — all 8 met AND pooled OOS Sharpe ≤ `SUSPICIOUS_SHARPE` (8.0).
+- **MARGINAL** — primary 5 met but any strict (6–8) fails OR pooled OOS Sharpe > 8.0 (look-ahead smell — manual review required).
+- **FAIL** — any primary criterion missed, or walk-forward skipped (N < `WF_MIN_TRADES`).
+
+Correlation vs h4 baseline < 0.5, rolling 30-day Sharpe stability, and combined-portfolio synergy are **deferred to L13 Phase 3b validation** (mirrors L10 Phase 2b). No MARGINAL/PASS variant deploys without Phase 3b.
+
+### Files
+
+- **`scripts/research_cvd_standalone.py`** — standalone-signal research driver. Reuses L8 framework (`build_features_tf`, `fetch_klines_ohlcv`, `load_{liquidations,oi,funding}_tf`, `_z_window`, `MARKET_FLUSH_FILTERS`, `RANK_HOLDING_HOURS`, `WF_FOLDS`, `WF_MIN_TRADES`), NetPos infrastructure (`run_variant`, `run_walkforward`, `format_final_ranking`, `SUSPICIOUS_SHARPE`, `_fmt_num`), CVD base features (`load_cvd_tf(..., include_cum_delta=True)`, `attach_cvd`), combo helpers (`apply_combo`, `_try_load_with_pepe_fallback`, `compute_cross_coin_features`), and `split_folds`. New pure functions: `_consecutive_count`, `build_exhaustion_features` (per-coin; consecutive counter operates on a single coin's frame — no cross-coin bleed because the function is called inside the per-coin loop before `compute_cross_coin_features`), `build_divergence_features` (reads `features_df["price"]`, which `build_features_tf` produces by renaming the ccxt `close` column on line 283 — do NOT expect a `close` column), `build_hypothesis_filters`, `custom_evaluate_verdict` (the 8-rule ladder), `_format_standalone_block` (local formatter — no baseline comparison since standalone signals have no reference).
+- **`scripts/test_research_cvd_standalone.py`** — 12 offline PASS + 3 optional DB-smoke (Block 4 skipped without DB). Block 1 (5) = feature engineering; Block 2 (4) = filter application; Block 3 (3) = verdict logic; Block 4 (3) = `load_cvd_tf(include_cum_delta=True)` exposes `cum_vol_delta`, ≥500 rows, UTC index.
+
+### Minimal modification
+
+- **`scripts/research_cvd.py`** — `load_cvd_tf(symbol, interval, include_cum_delta: bool = False)` gained a backward-compatible optional flag. Default `False` preserves Phase 2 behaviour byte-for-byte (two-column SELECT, empty-frame returns `["agg_taker_buy_vol", "agg_taker_sell_vol"]`). Passing `True` adds `cum_vol_delta` to the SELECT and the empty-frame column list. This is the only non-append change in Phase 3 — all other additions are new files.
+
+### Run
+
+```bash
+# Tests (offline + optional DB smoke)
+.venv/bin/python scripts/test_research_cvd_standalone.py    # expect PASS: 12 | FAIL: 0
+
+# Debug slice
+.venv/bin/python scripts/research_cvd_standalone.py --intervals h4 --hypotheses H5 --thresholds-h5 2.0
+
+# Full matrix (VPS, ~15-30 min)
+.venv/bin/python scripts/research_cvd_standalone.py | tee analysis/cvd_standalone_research_2026-04-17.txt
+```
+
+### Implementation notes verified in this session
+
+- `build_exhaustion_features` operates on one per-coin frame at a time (called inside the per-coin loop in `_load_coins_for_interval`, before `compute_cross_coin_features` merges cross-coin columns). The `_consecutive_count` vectorized routine uses `(mask != mask.shift()).fillna(True).cumsum()` as the group key so each sign flip starts a fresh `cumcount`. No state leaks across coins.
+- `price_change_6bars` reads `features_df["price"]`, not `"close"`. `build_features_tf` at line 283 of `backtest_market_flush_multitf.py` renames `close → price` when joining ccxt klines into the feature frame. If that rename ever changes, `build_divergence_features` will set `price_change_6bars = NaN` (guarded by `"price" in features_df.columns` check) rather than raise, so the signal will simply stop firing — a visible symptom, not a silent miscompute.
+
+### Expected outcomes
+
+- Any PASS/MARGINAL → **mandatory** L13 Phase 3b validation (correlation with h4 baseline < 0.5, rolling 30-day Sharpe stability, combined-portfolio synergy) before Phase 4 integration.
+- All FAIL → reject CVD standalone approach; next candidate: L11 SHORT research.
+- Walk-forward results TBD — to be filled in this section after VPS runs.
+
+### Do NOT
+
+- Change locked L3b-2 thresholds (z_self=1.0, z_market=1.5, n_coins≥4). Phase 3 does NOT use `market_flush` at all — standalone hypotheses have no dependency on it. The baseline row in the ranking is purely for cross-variant context (labelled `REF`, no PASS/FAIL).
+- Modify `bot/signal.py`, `bot/paper_executor.py`, or anything in `exchange/` in Phase 3 — research only.
+- Add new DB tables (Phase 1 data layer complete).
+- Test SHORT variants in this script — SHORT research belongs to L11 with its own threat model and hypothesis set.
+- Add a live CVD collector — backfill-only until a standalone edge is confirmed by Phase 3b.
+- Extend the threshold grid beyond the 3 defaults per hypothesis without a separate ExitPlanMode approval (overfit risk grows quadratically).
+- Mark pooled OOS Sharpe > 8.0 as PASS without manual inspection — auto-demoted to MARGINAL.
+- Ship any PASS/MARGINAL variant to live without completing L13 Phase 3b validation first.

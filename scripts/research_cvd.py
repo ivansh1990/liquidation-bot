@@ -78,20 +78,30 @@ DEFAULT_INTERVALS = ("h1", "h2", "h4")
 # DB loader
 # ---------------------------------------------------------------------------
 
-def load_cvd_tf(symbol: str, interval: str) -> pd.DataFrame:
+def load_cvd_tf(
+    symbol: str,
+    interval: str,
+    include_cum_delta: bool = False,
+) -> pd.DataFrame:
     """
-    Load agg_taker_buy_vol + agg_taker_sell_vol from
-    coinglass_cvd_{interval}. Returns a UTC-indexed DataFrame.
+    Load CVD columns from coinglass_cvd_{interval}. Returns a UTC-indexed
+    DataFrame.
 
-    `cum_vol_delta` is deliberately not selected — it is cumulative since
-    history-start and unused in Phase 2.
+    By default only `agg_taker_buy_vol` + `agg_taker_sell_vol` are selected —
+    `cum_vol_delta` is cumulative-since-history-start and unused in Phase 2.
+    Pass `include_cum_delta=True` (L13 Phase 3) to also load `cum_vol_delta`
+    for price/CVD divergence analysis.
     """
     table = f"coinglass_cvd_{interval}"
+    extra_col = ", cum_vol_delta" if include_cum_delta else ""
+    base_cols = ["agg_taker_buy_vol", "agg_taker_sell_vol"]
+    extra_cols = ["cum_vol_delta"] if include_cum_delta else []
+    all_cols = base_cols + extra_cols
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT timestamp, agg_taker_buy_vol, agg_taker_sell_vol
+                SELECT timestamp, agg_taker_buy_vol, agg_taker_sell_vol{extra_col}
                 FROM {table}
                 WHERE symbol = %s
                 ORDER BY timestamp
@@ -100,15 +110,11 @@ def load_cvd_tf(symbol: str, interval: str) -> pd.DataFrame:
             )
             rows = cur.fetchall()
     if not rows:
-        return pd.DataFrame(columns=["agg_taker_buy_vol", "agg_taker_sell_vol"])
-    df = pd.DataFrame(
-        rows, columns=["timestamp", "agg_taker_buy_vol", "agg_taker_sell_vol"]
-    )
+        return pd.DataFrame(columns=all_cols)
+    df = pd.DataFrame(rows, columns=["timestamp"] + all_cols)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.drop_duplicates(subset="timestamp").set_index("timestamp").sort_index()
-    return df.astype(
-        {"agg_taker_buy_vol": float, "agg_taker_sell_vol": float}
-    )
+    return df.astype({c: float for c in all_cols})
 
 
 # ---------------------------------------------------------------------------
