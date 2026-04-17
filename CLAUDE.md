@@ -1065,3 +1065,89 @@ No variant deploys without passing all 5. This codifies the L10 Phase 2b lesson:
 - Add dependencies to `requirements.txt`.
 - Run live fetch locally in the planning session — only offline tests (Block 3 skips without key). Full backfill runs on VPS after commit.
 - Extend scope (new columns, new indexes, new fallbacks, new hypotheses inside this section) without a separate ExitPlanMode approval.
+
+## Session L13 Phase 2 — CVD Research
+
+Motivation: L10 Phase 2b ALARM (H1_z1.5_h2 correlation 0.76 with h4 baseline → no diversification) justified a principled new signal class, not another filter on the same `market_flush` substrate. CVD (aggregated Cumulative Volume Delta) shows **aggressive market orders** — who initiated each bar's move. This is orthogonal to liquidations (forced exits) and NetPos (passive limit accumulation): CVD captures active positioning at the moment of the flush.
+
+Phase 2 scope: research script + tests only — no changes to `bot/`, `exchange/`, `telegram_bot/`, `collectors/`, or any locked script. Integration (Phase 3) conditional on a passing L13 Phase 2b validation pass (separate session).
+
+### Empirical probe findings (17 Apr 2026, Phase 1 data)
+
+- `coinglass_cvd.cum_vol_delta` is **cumulative since start-of-history**, not per-bar (BTC range −62B to +0.8B, median −39B). Phase 2 ignores it.
+- Per-bar delta = `agg_taker_buy_vol − agg_taker_sell_vol` is recomputed on the fly.
+- Cross-coin scale spans 5 orders of magnitude (BTC ~40B avg abs vs PEPE ~249M) → **per-coin z-score mandatory** (same pattern as NetPos).
+- PEPE fallback (`1000PEPE`) was reserved in `backfill_coinglass_cvd.py` but never triggered — canonical `PEPE` is the stored symbol across all 10 coins. Research script loads CVD directly without `_try_load_with_pepe_fallback`.
+
+### Hypotheses
+
+- **H3 Taker Buy Dominance** (ratio-based): `market_flush AND buy_ratio > threshold`, `buy_ratio = agg_taker_buy_vol / (agg_taker_buy_vol + agg_taker_sell_vol)`. Thresholds: `0.52, 0.55, 0.58`.
+- **H4 CVD Delta Divergence** (z-score based): `market_flush AND per_bar_delta_zscore > threshold`, z-window = `_z_window(bar_hours)` (15 calendar days: h4=90, h2=180, h1=360). Thresholds: `0.5, 1.0, 1.5`.
+
+Difference vs NetPos H1/H2: NetPos = accumulated limit orders (passive), CVD = aggressive market orders at the flush bar (active). Possibly one edge exists where the other doesn't.
+
+### PASS criteria (strengthened after L10 Phase 2b ALARM)
+
+**PASS** requires all of:
+1. Primary L8 criteria: pooled OOS Sharpe > 2.0, Win% > 55%, N ≥ 100, ≥2/3 OOS folds positive, pooled OOS > 1.0.
+2. **Absolute floor**: `trades_per_day ≥ 1.5` (not relative to baseline — Smart Filter needs ≥14 trading days / 30, so we want margin above the 0.5/day minimum).
+
+**MARGINAL**: primary 5 met, but trades/day below 1.5 OR pooled Sharpe > 8.0 (look-ahead smell — manual review required). **FAIL**: any primary criterion missed, or walk-forward skipped.
+
+Correlation vs h4 baseline < 0.5, rolling 30-day Sharpe stability, and combined-portfolio synergy are **deferred to L13 Phase 2b** (mirror of L10 Phase 2b). No PASS/MARGINAL variant ships live without Phase 2b validation.
+
+### New files
+
+- **`scripts/research_cvd.py`** — 18 variants + 3 baselines + walk-forward per interval, emits per-variant blocks, final 21-row ranking, and recommendation block. New helpers: `load_cvd_tf`, `build_cvd_features`, `attach_cvd`, `build_hypothesis_filters`. Reuses L8/NetPos infrastructure: `build_features_tf`, `_zscore_tf`, `fetch_klines_ohlcv`, `load_{liquidations,oi,funding}_tf`, `MARKET_FLUSH_FILTERS`, `run_variant`, `run_walkforward`, `evaluate_verdict`, `format_variant_block`, `format_final_ranking`, `compute_cross_coin_features`, `_try_load_with_pepe_fallback`, `split_folds`. Local wrapper `_format_cvd_variant_block` swaps NetPos's Contrarian/Confirmation description line for a CVD-aware one (buy_ratio vs per_bar_delta_zscore) — the underlying `format_variant_block` only renders `name` (no parsing), so reuse is safe.
+- **`scripts/test_research_cvd.py`** — 12 offline PASS (Blocks 1–3) + 3 optional DB smoke (Block 4). Mirrors `test_research_netposition.py` structure.
+
+### CLI
+
+```
+--intervals h1,h2,h4        (default all)
+--hypotheses H3,H4          (default both)
+--thresholds-h3 0.52,0.55,0.58  (buy_ratio, default)
+--thresholds-h4 0.5,1.0,1.5     (per_bar_delta_zscore, default)
+```
+
+### Variant labels
+
+- `H3_r0.55_h4` — ratio-based (`buy_ratio > 0.55`, interval h4)
+- `H4_z1.0_h2` — z-score based (`per_bar_delta_zscore > 1.0`, interval h2)
+
+### Guardrails (from L10 Phase 2 / 2b lessons)
+
+1. **h4 baseline parity check** vs L8 (Sharpe 5.87 / Win 61.0 / N 428) — warn (not fatal) on >5% drift.
+2. **Suspicious Sharpe** > 8.0 → auto-demote to MARGINAL; never auto-PASS.
+3. **trades/day ≥ 1.5** absolute floor (hard gate — a PASS from `evaluate_verdict` is demoted to MARGINAL when trades/day below this).
+4. **Subset monotonicity** covered by offline Block 2.
+5. **NaN on zero-denominator** for `buy_ratio` (defensive — real data is positive, but tested).
+
+### Run
+
+```bash
+# Offline tests (no DB needed)
+.venv/bin/python scripts/test_research_cvd.py                # expect 12 PASS
+
+# Full matrix run (architect trigger on VPS, ~15–30 min)
+.venv/bin/python scripts/research_cvd.py | tee analysis/cvd_research_2026-04-17.txt
+
+# Debug slice
+.venv/bin/python scripts/research_cvd.py --intervals h4 --hypotheses H3 --thresholds-h3 0.55
+```
+
+### Expected outcomes
+
+- Any PASS/MARGINAL → **mandatory** L13 Phase 2b validation (correlation with h4 baseline < 0.5, rolling 30-day Sharpe stability, combined-portfolio synergy) before Phase 3 integration.
+- All FAIL → reject CVD filter approach; next candidate: L11 SHORT research.
+- Walk-forward results TBD — to be filled in this section after VPS runs.
+
+### Do NOT
+
+- Change locked L3b-2 thresholds (z_self=1.0, z_market=1.5, n_coins≥4). CVD is an **additional filter** on top of baseline, not a replacement.
+- Modify `bot/signal.py`, `bot/paper_executor.py`, or anything in `exchange/` in Phase 2 — research only.
+- Add new DB tables (Phase 1 data layer complete).
+- Extend the threshold grid beyond the 3 defaults per hypothesis without a separate ExitPlanMode approval (overfit risk grows quadratically).
+- Mark Sharpe > 8.0 as PASS without manual inspection.
+- Ship any PASS/MARGINAL variant to live without completing L13 Phase 2b validation first.
+- Re-add the `1000PEPE` fallback for CVD — Phase 1 confirmed canonical `PEPE` stored; fallback is no-op + log clutter.
