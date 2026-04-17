@@ -952,3 +952,51 @@ If any (hypothesis, interval, threshold) PASSes with trades/day >= 70 % baseline
 - Extend the threshold grid beyond 0.5 / 1.0 / 1.5 without separate plan approval (overfit risk grows quadratically with grid size).
 - Recompute baseline numbers from scratch — L8 reference (h4: N=428, Win%=61.0, Sharpe=5.87) is the source of truth for parity checks.
 - Mark Sharpe > 8.0 as PASS without manual inspection (look-ahead smell).
+
+## Session L10 Phase 2b — H1_z1.5_h2 Validation
+
+Motivation: Phase 2 identified `H1_z1.5_h2` (N=296, Win% 61.6, pooled OOS Sharpe 5.15, 3/3 OOS positive) as the single stable Net Position filter candidate. But **pooled Sharpe over 3 OOS folds is three observations** — insufficient signal to decide deploy-vs-reject. Three unresolved questions block Phase 3: (1) does H1_z1.5_h2 diversify with the h4 baseline or merely duplicate it? (2) is it stable on a **rolling 30-day** window (Smart Filter operates monthly, not on aggregates)? (3) does a combined 50/50 portfolio show synergy? Phase 2b is a pure read-only analysis layer on top of Phase 2 — no changes to `bot/`, `exchange/`, or any locked script.
+
+### Three validation tests
+
+**Test 1 — Daily-return correlation (diversification):** Pearson correlation between per-day pnl series, plus 4-way overlap breakdown on common active days (both_win / both_lose / h4_win_h2_lose / h4_lose_h2_win). PASS = `corr < 0.5` AND `mixed_pct >= 15%` (diversification benefit, not duplication).
+
+**Test 2 — Rolling 30-day Sharpe stability:** Slide a 30-day window across each strategy's daily pnl series (180d → 151 windows). Per window: skip if `<5` active days (`MIN_ROLLING_WINDOW_ACTIVE_DAYS`) or if `std <= STD_EPS (1e-12)` — the std-guard absorbs floating-point degeneracy on synthetic inputs only (real trade data has continuously-varying `pnl_pct` and therefore never produces exact-constant 30-day slices). Annualized Sharpe = `mean/std(ddof=1) * sqrt(365)`. The report prints `used=N/total  dropped_low_activity_pct` — a warning fires if drop-rate >30% (suggests `min_trading_days` is miscalibrated for the strategy's trade frequency). PASS (each strategy): `min > 0` AND `median > 2.0` AND `>= 60%` windows with Sharpe > 2 AND `>= 50%` windows with win-days >= 65% (Smart Filter monthly condition simulator).
+
+**Test 3 — Combined 50/50 portfolio (synergy):** `combined_usd = 0.5*capital*h4_pct/100 + 0.5*capital*h2_pct/100`. Equity curve -> running-max -> drawdown -> MDD (negative number; "less severe" = "greater"). PASS = `combined_sharpe > max(h4_solo, h2_solo)` AND `combined_mdd > h4_solo_mdd` AND `combined_win_days >= h4_solo_win_days`.
+
+### Recommendation logic
+
+| Condition | Verdict | Next step |
+|-----------|---------|-----------|
+| Test 2 (h4) FAIL | `ALARM` | Pause Phase 3; investigate baseline |
+| Test 1 FAIL or Test 3 FAIL | `REJECT` | Skip to L11 SHORT research |
+| Test 1 + Test 3 PASS, Test 2 (h2) PASS | `STRONG_GO` | Phase 3 integration + paper trading |
+| Test 1 + Test 3 PASS, Test 2 (h2) FAIL | `WEAK_GO` | Paper trading MANDATORY before live |
+
+### Files
+
+- `scripts/validate_h1_z15_h2.py` — standalone validator. Reuses `_load_coins_for_interval` and `build_hypothesis_filters` from `research_netposition.py`, `MARKET_FLUSH_FILTERS` and `RANK_HOLDING_HOURS` from `backtest_market_flush_multitf.py`, `apply_combo` from `backtest_combo.py`. Pure functions: `extract_trade_records`, `aggregate_daily_pnl`, `compute_correlation_test`, `compute_rolling_sharpe_test`, `compute_combined_portfolio_test`, `recommend`, `format_report`. Entry `main()` loads h4 + h2 dataframes -> extracts per-trade records -> aggregates daily pnl -> runs three tests -> emits recommendation.
+- `scripts/test_validate_h1_z15_h2.py` — 14 offline assertions in 5 blocks: daily aggregation (3), correlation & overlap (3), rolling Sharpe (2), combined portfolio (2), edge-case handlers (4 — zero-std skip, all-zero low-activity drop, 4-active-days-threshold boundary, dense-activity zero-drop).
+
+### Trade extraction (key design point)
+
+`run_variant` in `research_netposition.py` returns aggregate-only dicts — no per-trade records. Rather than modify the locked Phase 2 signature, `extract_trade_records` **replicates the internal mask logic** (`apply_combo(df, filters)` -> `df.loc[mask, return_{h}h].dropna()`) while preserving per-trade metadata: `{coin, entry_ts, exit_ts = entry_ts + holding_hours, pnl_pct}`. Parity risk: if this helper ever drifts from `run_variant`'s filter, pooled N/Sharpe would diverge. Mitigation: the report prints observed pooled `(N, Win%, Sharpe)` side by side so drift is visible.
+
+### Run
+
+```bash
+# Offline tests (no DB)
+.venv/bin/python scripts/test_validate_h1_z15_h2.py       # 14 PASS
+
+# Validation run (requires VPS-populated DB, ~5-10 min)
+.venv/bin/python scripts/validate_h1_z15_h2.py | tee analysis/validation_h1_z15_h2_2026-04-17.txt
+```
+
+### Do NOT
+
+- Modify `scripts/research_netposition.py` or `scripts/backtest_market_flush_multitf.py` (Phase 2 / L8 locked).
+- Change `bot/signal.py`, `bot/paper_executor.py`, or anything under `exchange/` — Phase 2b is research-only.
+- Add new DB tables or new deps (`requirements.txt` unchanged).
+- Ship to live on `WEAK_GO` without paper trading. Paper is mandatory.
+- Interpret Test 3 MDD with "less negative" intuition backwards: `combined_mdd > h4_solo_mdd` means combined drew down LESS than h4 solo (both are <= 0).
