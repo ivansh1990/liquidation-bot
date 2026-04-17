@@ -104,6 +104,33 @@ SF_30D_MDD_THRESHOLD_PCT: float = 20.0
 # Binance klines history to fetch (matches CoinGlass Startup backfill).
 FETCH_DAYS: int = 180
 
+# Minimum N for a 100 %-win OOS fold to be treated as look-ahead evidence
+# instead of a small-sample artifact. Aligned with WF_MIN_TRADES so the
+# halt logic matches the walk-forward split's own minimum-trades gate.
+SUSPICIOUS_WIN_RATE_MIN_N: int = 30
+
+
+def check_lookahead_guard(
+    folds: list[dict],
+    min_n: int = SUSPICIOUS_WIN_RATE_MIN_N,
+) -> tuple[bool, dict | None]:
+    """Decide whether OOS folds show a look-ahead smell.
+
+    Returns (should_halt, offending_fold_or_None). Halts only when an OOS
+    fold has n >= min_n AND win_pct >= 100.0. TRAIN folds never trigger
+    (they overfit by construction). Small-N OOS folds with 100% win rate
+    are sample artifacts and are ignored.
+    """
+    for fold in folds:
+        label = fold.get("label", "")
+        if not label.startswith("OOS"):
+            continue
+        n = fold.get("n", 0) or 0
+        win_pct = fold.get("win_pct")
+        if n >= min_n and win_pct is not None and win_pct >= 100.0:
+            return True, fold
+    return False, None
+
 
 # ---------------------------------------------------------------------------
 # Pure functions (test surface)
@@ -668,22 +695,23 @@ def main() -> int:
 
             verdict = evaluate_verdict(variant, wf, sf_window_df)
 
-            # Explicit 100%-win OOS fold halt (look-ahead smell).
+            # 100%-win OOS fold halt — look-ahead smell. Only fires on
+            # folds with N >= SUSPICIOUS_WIN_RATE_MIN_N; small-N perfect
+            # wins are sample artifacts and are logged in the normal
+            # fold table without halting.
             if not wf.get("skipped"):
-                for fold in wf.get("folds", []):
-                    if (
-                        fold["label"].startswith("OOS")
-                        and fold.get("n", 0) > 0
-                        and fold.get("win_pct") == 100.0
-                    ):
-                        print()
-                        print(
-                            f"[!!] STOPPING: {name} fold {fold['label']} "
-                            f"reports 100% win rate (N={fold.get('n')}). "
-                            f"Likely look-ahead in features. Investigate "
-                            f"before trusting report."
-                        )
-                        sys.exit(2)
+                should_halt, bad_fold = check_lookahead_guard(
+                    wf.get("folds", []), SUSPICIOUS_WIN_RATE_MIN_N
+                )
+                if should_halt:
+                    print()
+                    print(
+                        f"[!!] LOOK-AHEAD SUSPICION: {name} fold "
+                        f"{bad_fold['label']} N={bad_fold.get('n')} "
+                        f"reports 100% win rate. Investigate before "
+                        f"trusting report."
+                    )
+                    sys.exit(2)
 
             print()
             print(format_variant_block(

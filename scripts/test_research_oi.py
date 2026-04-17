@@ -23,9 +23,11 @@ sys.path.insert(0, _THIS_DIR)
 
 from research_oi_standalone import (  # noqa: E402
     HYPOTHESES,
+    SUSPICIOUS_WIN_RATE_MIN_N,
     Z_WINDOW_OI,
     apply_direction,
     build_oi_filters,
+    check_lookahead_guard,
     compute_oi_velocity_zscore,
     evaluate_verdict,
     extract_trade_records,
@@ -314,6 +316,47 @@ def test_block4_verdict() -> None:
         ok,
         f"pass={verdict_pass} marg={verdict_marginal} fail={verdict_fail} "
         f"susp={verdict_suspicious}",
+    )
+
+    # Lookahead guard: N-aware halt logic (+3 assertions).
+    small_n_folds = [
+        {"label": "OOS1", "n": 3, "win_pct": 100.0, "sharpe": 15.0},
+        {"label": "OOS2", "n": 50, "win_pct": 55.0, "sharpe": 1.5},
+        {"label": "OOS3", "n": 40, "win_pct": 52.0, "sharpe": 1.0},
+    ]
+    halt_small, bad_small = check_lookahead_guard(
+        small_n_folds, SUSPICIOUS_WIN_RATE_MIN_N
+    )
+    report(
+        "small-N (N=3) 100%-win OOS does NOT trigger halt",
+        halt_small is False and bad_small is None,
+        f"got halt={halt_small} bad={bad_small}",
+    )
+
+    large_n_folds = [
+        {"label": "OOS1", "n": 45, "win_pct": 100.0, "sharpe": 25.0},
+        {"label": "OOS2", "n": 50, "win_pct": 55.0, "sharpe": 1.5},
+    ]
+    halt_large, bad_large = check_lookahead_guard(
+        large_n_folds, SUSPICIOUS_WIN_RATE_MIN_N
+    )
+    report(
+        "large-N (N=45) 100%-win OOS DOES trigger halt",
+        halt_large is True and bad_large is not None and bad_large["n"] == 45,
+        f"got halt={halt_large} bad={bad_large}",
+    )
+
+    train_only = [
+        {"label": "TRAIN", "n": 100, "win_pct": 100.0, "sharpe": 12.0},
+        {"label": "OOS1", "n": 50, "win_pct": 55.0, "sharpe": 1.5},
+    ]
+    halt_train, bad_train = check_lookahead_guard(
+        train_only, SUSPICIOUS_WIN_RATE_MIN_N
+    )
+    report(
+        "TRAIN fold 100%-win never triggers halt",
+        halt_train is False and bad_train is None,
+        f"got halt={halt_train} bad={bad_train}",
     )
 
 
