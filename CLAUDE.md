@@ -1282,3 +1282,67 @@ Motivation: L13 Phase 3 produced exactly one **qualified MARGINAL** — **H5_z2.
 - Ship to live on `WEAK_GO` without paper trading. Paper is mandatory.
 - Interpret Test 3 MDD sign backwards — both MDDs are ≤ 0, and "less severe" = "greater" (closer to zero).
 - Import `_load_coins_for_interval` from `research_netposition.py` for H5 — it does not attach CVD features and H5 filters will silently produce 0 trades.
+
+## Session L13 Phase 3c — Smart Filter Adequacy Test
+
+Motivation: L13 Phase 3b verdict = **ALARM**, but close reading showed the verdict was an **auto-trigger from h4 baseline Test 2 FAIL**, not a judgment on H5_z2.5_h2. Underlying numbers were more nuanced — Test 1 correlation 0.44 with 20.7 % mixed days (diversification proven), Test 3 combined Sharpe 1.907 > h4 solo 1.796 with MDD halved to $381 — but Test 2's abstract "rolling 30-day Sharpe > 2 + win_days ≥ 65 %" gate penalised sparse strategies unfairly because `win_days_ratio` was computed on **total calendar days** rather than **active trading days**. That metric does not match any actual exchange rule. Phase 3c reformulates the validation against the **actual Binance Copy Trading Smart Filter** to see whether the Phase 3b ALARM is a false negative.
+
+### Smart Filter actual rules (Binance Copy Trading Lead Trader)
+
+1. Trading days >= 14 in the last 30 days.
+2. PnL positive on 30d / 60d / 90d rolling windows.
+3. Win days ratio >= 65 % (30d/60d), >= 60 % (90d) — computed on **trading days**, not calendar days.
+4. Max drawdown <= 20 %.
+
+Window configs (hardcoded in `SMART_FILTER_CONFIGS`): 30d/14 trading days/65 %/20 %, 60d/28/65 %/20 %, 90d/42/60 %/20 %. `min_trading_days` scaled pro rata (14/30 = 0.467).
+
+### Files
+
+- **`scripts/smart_filter_adequacy.py`** — standalone driver. Imports `run_h4_baseline`, `run_h5_z25_h2` from `validate_h5_z25_h2.py` (both already module-level, no modification needed) and `DEFAULT_CAPITAL_USD` from `validate_h1_z15_h2.py`. Pure functions: `compute_daily_metrics`, `simulate_smart_filter_windows`, `summarize_smart_filter_results`, `recommend`, `format_report`. Main flow: init DB → load h4 + H5 trade lists → build common `date_range` → per-day metrics per strategy → inline 50/50 combined DataFrame (`combined_pnl_usd = 0.5*capital*h4_pct/100 + 0.5*capital*h5_pct/100`) → slide 30d/60d/90d windows across each → 9 summaries → `recommend()` → print.
+- **`scripts/test_smart_filter_adequacy.py`** — 10 offline PASS + 1 optional DB smoke. Block 1 (3) = `compute_daily_metrics` (columns, zero-trade days, equity invariants), Block 2 (4) = `simulate_smart_filter_windows` (length invariant, PASS case, low-activity fail, negative-pnl fail), Block 3 (4) = `recommend` verdict tree covering STRONG_GO / H4_DONT_ADD / REJECT_BOTH / H5_ONLY branches, Block 4 (optional) = live `run_h4_baseline` against DB.
+
+### Metric reformulation (vs Phase 3b)
+
+| Metric | Phase 3b | Phase 3c |
+|--------|----------|----------|
+| Win days ratio | `winning_days / total_calendar_days` | `winning_days / trading_days` (active basis) |
+| PnL gate | Rolling Sharpe > 2 (abstract) | `sum(pnl_usd) > 0` (actual rule) |
+| Trading-days gate | Implicit (drop windows with < 5 active) | Explicit `>= 14 (pro-rata)` per-window gate |
+| MDD gate | Not in criteria | Explicit `abs(mdd_pct) <= 20` per-window |
+
+### Recommendation tree (6 outcomes)
+
+Adequacy = `pass_rate_pct >= 60 %` of 30d windows (the primary Smart Filter gate). 60d/90d printed for diagnostic context but not gating.
+
+| h4 30d | H5 30d | Combined 30d | Verdict | Next action |
+|--------|--------|--------------|---------|-------------|
+| ≥60% | ≥60% | ≥60% | `STRONG_GO` | Phase 4 integration, deploy combined |
+| ≥60% | <60% | ≥60% | `H4_ONLY` | Deploy h4 solo, paper H5 |
+| <60% | ≥60% | ≥60% | `H5_ONLY` | Deploy H5 solo (unusual — verify manually) |
+| <60% | <60% | ≥60% | `COMBINED_ONLY` | Deploy combined only; synergy required |
+| ≥60% | * | <60% | `H4_DONT_ADD` | Deploy h4 solo, skip H5, move to L11 SHORT |
+| <60% | * | <60% | `REJECT_BOTH` | Fundamental rethink |
+
+### Phase 3b vs Phase 3c deployment authority
+
+**Phase 3c supersedes Phase 3b for the `h4 + H5` combined-portfolio decision.** The Phase 3b ALARM rested on a metric (total-day win ratio) that does not match actual exchange rules. If Phase 3c's 30d pass rates clear 60 % for any combination, the Phase 3b verdict is considered a false negative for that configuration. Phase 3b's diversification (Test 1) and synergy (Test 3) findings stand independently — they don't conflict with Phase 3c.
+
+### Run
+
+```bash
+# Offline tests (DB smoke auto-skips)
+.venv/bin/python scripts/test_smart_filter_adequacy.py    # expect 10 PASS (11 with DB)
+
+# Adequacy run (VPS with populated DB, ~5-10 min)
+.venv/bin/python scripts/smart_filter_adequacy.py | tee analysis/smart_filter_adequacy_2026-04-17.txt
+```
+
+### Do NOT
+
+- Modify `scripts/validate_h5_z25_h2.py`, `validate_h1_z15_h2.py`, `research_cvd_standalone.py`, or any other L8/L10/L13 locked script — import-only reuse.
+- Change `bot/`, `exchange/`, `telegram_bot/`, or `collectors/` — research-only session.
+- Add new DB tables or new deps (`requirements.txt` unchanged).
+- Shoehorn `aggregate_daily_pnl` (Phase 2b) into the combined-portfolio math — it returns a `pd.Series` and lacks `trade_count` / `is_active` / `is_winning` / `equity_usd` columns needed for Smart Filter gates. Build `compute_daily_metrics` from scratch on the raw trade list.
+- Use Phase 3b's Test 2 verdict as a Smart Filter adequacy substitute — the calendar-day vs trading-day basis is a material difference that penalises sparse strategies unfairly.
+- Raise the adequacy threshold above 60 % without a separate ExitPlanMode approval — the 60 % value is calibrated to leave slack for month-to-month variance while still signalling habitual adequacy.
+- Deploy live on an `H5_ONLY` verdict without manual investigation — h4 failing solo while H5 succeeds solo is an unusual outcome that warrants skeptical review (may indicate a regime shift that invalidates the locked baseline).
