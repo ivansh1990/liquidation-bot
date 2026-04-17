@@ -1000,3 +1000,68 @@ Motivation: Phase 2 identified `H1_z1.5_h2` (N=296, Win% 61.6, pooled OOS Sharpe
 - Add new DB tables or new deps (`requirements.txt` unchanged).
 - Ship to live on `WEAK_GO` without paper trading. Paper is mandatory.
 - Interpret Test 3 MDD with "less negative" intuition backwards: `combined_mdd > h4_solo_mdd` means combined drew down LESS than h4 solo (both are <= 0).
+
+## Session L13 Phase 1 — CVD Data Layer
+
+Motivation: After ALARM verdict in L10 Phase 2b (H1_z1.5_h2 correlation 0.76 with h4 baseline → no diversification) a principled new signal class is needed — one that is not another filter on the same `market_flush` substrate. CVD (aggregated Cumulative Volume Delta) shows **aggressive market orders** — who initiated each bar's move, buyers or sellers as aggressors. This is distinct from liquidations (forced exits) and net position (limit-order accumulation), and is the data substrate for future Phase 2 hypotheses on exhaustion and price/CVD divergence.
+
+Phase 1 scope: data layer only — backfill script, schema, tests. NO hypothesis testing (Phase 2).
+
+### Endpoint findings (17 Apr 2026, Startup tier)
+
+- URL: `https://open-api-v4.coinglass.com/api/futures/aggregated-cvd/history`
+- Params: `exchange_list=<CG_EXCHANGES>` (multi-exchange aggregation, same set as L8 aggregated-liquidation), `symbol=<COIN_NAME>` (coin-level, not pair format), `interval`, `limit`
+- Response per bar: `time` (ms), `agg_taker_buy_vol` (USD), `agg_taker_sell_vol` (USD), `cum_vol_delta` (USD per-bar delta, = buy − sell, despite the "cumulative" name)
+- `startTime`/`endTime` silently ignored, same as other aggregated-* endpoints
+- `limit = 4320` on h1 → 4320 rows (180 days in one request) — same single-request pattern as L8 aggregated-liquidation and L10 net-position
+- PEPE fallback: primary `PEPE` used first; `1000PEPE` reserved as coin-level fallback (mirrors sibling `CG_FALLBACKS`)
+
+### New tables
+
+`coinglass_cvd_h1`, `coinglass_cvd_h2`, `coinglass_cvd_h4` — identical schema. Columns: `timestamp`, `symbol` (canonical coin), `agg_taker_buy_vol`, `agg_taker_sell_vol`, `cum_vol_delta`. `UNIQUE (timestamp, symbol)` + index on `(symbol, timestamp)`. No `exchange` column — CVD is pre-aggregated server-side across the `CG_EXCHANGES` set.
+
+Created inline by `backfill_coinglass_cvd.py` (no `SCHEMA_SQL` change, matches L8/L10 pattern).
+
+### Backfill script
+
+`scripts/backfill_coinglass_cvd.py` — single-request per coin (`limit = days × INTERVAL_BARS_PER_DAY[interval]`), reuses `CG_SYMBOLS` / `CG_EXCHANGES` / `REQUEST_SLEEP_S` / `INTERVAL_BARS_PER_DAY` / `_get_json` / `_pick_float` / `_t` from sibling scripts. 10 requests per run (~25s). PEPE `1000PEPE` fallback on empty primary. Idempotent via `ON CONFLICT (timestamp, symbol) DO NOTHING`.
+
+### Run
+
+```bash
+# Tests (offline + optional live smoke)
+.venv/bin/python scripts/test_backfill_cvd.py   # expect PASS: 9 | FAIL: 0
+
+# Backfill all three intervals (10 requests each, ~25s)
+.venv/bin/python scripts/backfill_coinglass_cvd.py --interval h1 --days 180
+.venv/bin/python scripts/backfill_coinglass_cvd.py --interval h2 --days 180
+.venv/bin/python scripts/backfill_coinglass_cvd.py --interval h4 --days 180
+
+# Verify
+psql -d liquidation -c "SELECT symbol, COUNT(*), MIN(timestamp)::date FROM coinglass_cvd_h1 GROUP BY symbol ORDER BY symbol;"
+```
+
+### Phase 2 roadmap (NOT in Phase 1)
+
+Phase 2 will test two hypotheses with **stricter PASS criteria** (lessons from Phase 2b ALARM):
+
+- **H3 CVD Divergence:** `market_flush` AND `cum_vol_delta_zscore > 1.5` — aggressive buyers stepping in despite the flush.
+- **H4 CVD Exhaustion:** standalone signal — extreme CVD z-score in one direction for 3+ bars → entry in the opposite direction.
+
+**New PASS criteria (all 5 must hold):**
+
+1. Primary L8 criteria — pooled OOS Sharpe > 2.0, Win% > 55%, N ≥ 100, ≥2/3 OOS folds positive.
+2. Rolling 30-day Sharpe — min > 0, median > 2.0, ≥60% windows with Sharpe > 2.
+3. Correlation with h4 baseline < 0.5 (mandatory for any new strategy).
+4. Combined portfolio Sharpe > max(h4 solo, new solo) — synergy required.
+5. Trades/day ≥ 1.5 (absolute floor, not relative to baseline).
+
+No variant deploys without passing all 5. This codifies the L10 Phase 2b lesson: pooled aggregate Sharpe alone is insufficient — diversification, monthly stability, and absolute trade frequency are co-equal gates.
+
+### Do NOT
+
+- Build a live CVD collector in Phase 1 — backfill-only.
+- Modify `bot/`, `exchange/`, `telegram_bot/`, or sibling backfill scripts (import-only reuse).
+- Add dependencies to `requirements.txt`.
+- Run live fetch locally in the planning session — only offline tests (Block 3 skips without key). Full backfill runs on VPS after commit.
+- Extend scope (new columns, new indexes, new fallbacks, new hypotheses inside this section) without a separate ExitPlanMode approval.
