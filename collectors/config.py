@@ -53,6 +53,8 @@ def price_step(coin: str, current_price: float) -> float:
         return PRICE_STEPS[coin]
     # ~1% of current price, rounded to a nice number
     raw = current_price * 0.01
+    if raw <= 0:
+        return 0.0
     if raw >= 1:
         return round(raw)
     elif raw >= 0.1:
@@ -61,8 +63,16 @@ def price_step(coin: str, current_price: float) -> float:
         return round(raw, 2)
     elif raw >= 0.001:
         return round(raw, 3)
-    else:
+    elif raw >= 0.0001:
         return round(raw, 4)
+    elif raw >= 0.00001:
+        return round(raw, 5)
+    elif raw >= 0.000001:
+        return round(raw, 6)
+    elif raw >= 0.0000001:
+        return round(raw, 7)
+    else:
+        return round(raw, 8) or raw
 
 
 class Config(BaseSettings):
