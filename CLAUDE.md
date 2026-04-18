@@ -1844,3 +1844,70 @@ L18a fix deployed 2026-04-18 → ~6 days of PEPE data in `hl_liquidation_map` by
 - Upgrade CG tier on your own authority. Business-level decision.
 - Add new dependencies to `requirements.txt`.
 
+## Session L-jensen-percoin — Per-coin Alpha/Beta Decomposition (2026-04-18)
+
+Goal: decompose the portfolio-level L-jensen `INCONCLUSIVE` verdict (α=+1.36 pp/day, two-sided HAC p=0.0555; β=+1.65 p=0.15; R²=0.124; subsample β unstable 0.24 → 2.23) into per-coin regressions and find a subset whose combined portfolio passes both Jensen AND Smart Filter adequacy. If found → narrow-universe deployment candidate. If not → confirms market_flush INCONCLUSIVE is structural, not an averaging artifact.
+
+### Files
+
+- **`scripts/jensen_percoin.py`** — main analysis driver. Imports from `analysis/jensen_alpha.py` (all helpers + loaders), `scripts/smart_filter_adequacy.py` (`compute_daily_metrics`, `simulate_smart_filter_windows`), and `scripts/validate_h1_z15_h2.py` (`extract_trade_records` via `load_market_flush_daily_pnl`). Pure functions: `per_coin_daily_pnl`, `per_coin_descriptive_stats`, `per_coin_regression`, `combined_portfolio_daily_pnl`, `combined_jensen`, `combined_passes_jensen`, `combined_smart_filter`, `combined_sf_failing_criteria`, `build_subset` (greedy + SF1 fallback), `_beta_contributions`, `categorize_stability` (CI1: STABLE / PARTIAL / UNSTABLE categorization, no auto-removal), `subset_stability_summary`, `recent_window_check` (SF2, non-blocking), `expected_vs_actual_commentary` (NTH), `recommend`, `format_percoin_report`, `main`. Writes `analysis/jensen_percoin_report_<UTC-timestamp>.md` (gitignored, same dir as L-jensen report).
+- **`scripts/test_jensen_percoin.py`** — 9 test functions, 27 assertions, offline only (no DB needed; uses synthetic daily P&L series per coin with `numpy.random.default_rng`). Covers: all-genuine subset, mixed structure, all-leveraged rejection, SF failure on sparse trading, CI1 stability categorization with explicit STABLE (ratio 1.2) / PARTIAL (ratio 2.0) / UNSTABLE (ratio 9× = L-jensen portfolio) / sign-flip cases, REGIME_DEPENDENT override when ≥50% UNSTABLE, n_trades<15 descriptive-only path, greedy ordering by ascending α p-value, SF1 β-contribution helper (highest-|β|-weighted-by-n dropped first), SF2 recent-30d deterioration flag.
+
+### Three approved changes vs original spec (CI1 / SF1 / SF2)
+
+- **CI1 Stability categorization, not removal.** L-jensen portfolio itself had β ratio ≈ 9× between halves — an auto-2× removal threshold would eliminate every candidate coin. Per-coin stability is now categorized (STABLE: β ratio ≤1.5; PARTIAL: 1.5–3×; UNSTABLE: sign flip OR ratio >3×; near-zero-β fallback uses |Δβ|). Overall verdict flips to `REGIME_DEPENDENT` iff ≥50% of subset coins are UNSTABLE; otherwise subset stands with stability flags in notes.
+- **SF1 Seed-fails-gates fallback.** If the initial `GENUINE_ALPHA`-only seed set fails the combined Jensen OR SF gate, don't immediately `NO_SUBSET_FOUND`. Order seed coins by descending `|β_contribution| = |β_c × (n_trades_c / Σn_trades)|` and remove one at a time until combined passes or N=1. A passing N=1 subset is reported as `DEPLOY_SUBSET` with an explicit "N=1 fragile — provisional" annotation.
+- **SF2 Recent-window sanity (non-blocking).** After the combined subset passes SF on the full L-jensen window (148 days), rerun the SF gate on the last 30 days as a single window. If it fails any of the three SF gates, annotate `RECENT_DETERIORATION` in the report. Non-blocking — does NOT change the recommendation label.
+- **NTH Expected-vs-actual commentary.** If a subset is found, report includes a short paragraph comparing subset composition to a naive prior (majors BTC/ETH carry higher β → less α; mid/low-caps carry more idiosyncratic α). Flags counter-intuitive composition (e.g. all-majors subset) as potential sample artifact warranting manual review.
+
+### Report sections (`analysis/jensen_percoin_report_<UTC-ts>.md`)
+
+1. Summary + recommendation label.
+2. Per-coin descriptive stats (all 10 coins, sorted by n_trades descending).
+3. Per-coin regression table (coins with n_trades ≥ 15; low-N warning column for 15 ≤ n < 30).
+4. Subset construction trace (every seed / removal / add step + combined Jensen + combined SF + pass flags).
+5. Final candidate subset (combined Jensen table + combined SF table, or "no subset" + reason).
+6. Subsample stability per subset coin (STABLE / PARTIAL / UNSTABLE category + method + β ratio or |Δβ|).
+7. Recent-window sanity (last 30d SF gates, `RECENT_DETERIORATION` flag if triggered).
+8. Expected vs actual commentary.
+9. Recommendation recap.
+
+### Recommendation labels
+
+- `DEPLOY_SUBSET` — combined passes both Jensen + SF gates, stability OK → paper-trade candidate.
+- `PARTIAL_SUBSET` — subset passes only one gate (Jensen or SF, not both). Extend sample or combine with orthogonal signal.
+- `NO_SUBSET_FOUND` — no coin combination passes. Confirms market_flush INCONCLUSIVE is structural. Pivot to next parallel signal (L6b on 2026-04-24, or L11 SHORT, or H1 liquidation velocity).
+- `REGIME_DEPENDENT` — subset exists but ≥50% of coins UNSTABLE between halves. Fragile; consider regime-filtered variant as separate session.
+- `INSUFFICIENT_DATA_ALL_COINS` — all 10 coins have n_trades < 15. Descriptive stats only; re-run after more trades accumulate.
+
+### Run
+
+```bash
+# Offline tests
+.venv/bin/python scripts/test_jensen_percoin.py    # expect PASS: 27 | FAIL: 0
+
+# Real-data analysis (VPS only — requires DB + internet for ccxt BTC klines)
+.venv/bin/python scripts/jensen_percoin.py
+# stdout: recommendation label + subset + key numbers
+# file:   analysis/jensen_percoin_report_<UTC-timestamp>.md
+```
+
+### Results
+
+**TBD** — populate after VPS run. Architect will return result + recommendation; based on that:
+- `DEPLOY_SUBSET` → scope L18b narrow-universe paper deployment parallel to L6b.
+- `NO_SUBSET_FOUND` → confirm structural INCONCLUSIVE, proceed with L6b as primary, consider H1 liquidation velocity as next candidate.
+- `PARTIAL_SUBSET` → discuss combining with orthogonal signal or holding-period tuning.
+- `REGIME_DEPENDENT` → scope regime-filtered variant as separate session.
+
+### Do NOT
+
+- Modify `analysis/jensen_alpha.py`, `scripts/validate_h1_z15_h2.py`, `scripts/smart_filter_adequacy.py`, `scripts/backtest_market_flush_multitf.py` — import-only reuse. All are locked.
+- Change `market_flush` filters, thresholds, holding period, or coin list (L8 + L3b-2 locked).
+- Re-run the backtest or regenerate trades — trade list comes from the locked L8 baseline via `extract_trade_records`.
+- Modify `bot/`, `exchange/`, `telegram_bot/`, `collectors/`, or add DB tables / dependencies.
+- Deploy live on `DEPLOY_SUBSET` without paper trading — L6b schedule and paper-trade requirement unchanged.
+- Interpret `N=1` as equivalent to a diversified N≥2 subset — explicitly flagged fragile in the report.
+- Auto-remove UNSTABLE coins from the subset (CI1 lesson — the original spec said to; changed because it would eliminate everything on a regime where β drifts, as it did 2025-10 → 2026-04).
+- Gate the recommendation on the recent-30d check (SF2 is non-blocking — it annotates, it does not veto).
+
