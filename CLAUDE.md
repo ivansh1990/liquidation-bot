@@ -1911,3 +1911,74 @@ Goal: decompose the portfolio-level L-jensen `INCONCLUSIVE` verdict (α=+1.36 pp
 - Auto-remove UNSTABLE coins from the subset (CI1 lesson — the original spec said to; changed because it would eliminate everything on a regime where β drifts, as it did 2025-10 → 2026-04).
 - Gate the recommendation on the recent-30d check (SF2 is non-blocking — it annotates, it does not veto).
 
+## Session A — FLUSH_BOT TP-at-Cluster Research (2026-04-18)
+
+Motivation: L-jensen-percoin confirmed genuine α on the SOL/ETH/DOGE subset of `market_flush` h4. The binding blocker for Binance Smart Filter deployment is clustering — `median 30d trading days = 8` vs the ≥14 gate. Current exit is time-based at `RANK_HOLDING_HOURS = 8h`. Hypothesis: replacing the 8h time exit with an earlier cluster-targeted TP could improve Win%, reduce per-trade drawdown, and lift trading-day density enough to clear SF adequacy standalone.
+
+Pure post-hoc analysis — **no changes** to `bot/`, `exchange/`, `telegram_bot/`, `collectors/`, or any locked L2/L3/L8/L-jensen/L10–L16 script. Import-only reuse.
+
+### What the script does
+
+Replays the locked L8 baseline trade list (~428 trades) via `extract_trade_records` (reused from `validate_h1_z15_h2.py`) → rehydrates each trade's `entry_price` from the feature frame's `price` column → finds the nearest forward h4 bar (≤ 8h out) whose `short_vol_zscore > 2.0` AND whose close is above entry (= upside short-squeeze cluster) → simulates a TP fill at `entry + (cluster − entry) × TP_level` for 9 TP levels {0.50, 0.75, 0.80, 0.90, 0.99, 0.995, 1.00, 1.05, 1.10}, max-hold-capped at 8h → aggregates pooled metrics per TP level → runs Jensen regression and Smart Filter 30d adequacy per TP → plateau-checks the Sharpe-optimal level → emits one of 5 recommendation labels.
+
+### Cluster substrate
+
+`coinglass_liquidations` (h4, 180 days, 10 coins) — bar-level totals only, no per-price-level granularity. Cluster "price level" = bar-close price of the spike bar. Coarse approximation accepted for this session; HL liquidation map (L6 substrate) would be finer but only has ~11 days of coverage vs the 180 needed. Per-price-level refinement is future work if results warrant.
+
+**Short-side convention:** a forward bar with high `short_vol_usd` = shorts got squeezed = price spiked UP through that level → that's the upside cluster a LONG fade entry should target (matches L6 `short_liq_above` convention). Spec literally said `long_liq_usd` but the semantically-right side is shorts — architect-confirmed during plan review.
+
+### Files
+
+- **[scripts/flush_tp_research.py](scripts/flush_tp_research.py)** — main driver. Pure functions: `find_short_cluster_above`, `simulate_tp_exit`, `sweep_tp_levels`, `per_coin_breakdown`, `plateau_check`, `build_recommendation`, `format_flush_tp_report`. Data loader: `_build_data_cache_and_trades` reuses `MARKET_FLUSH_FILTERS`, `RANK_HOLDING_HOURS`, `build_features_tf`, `fetch_klines_ohlcv`, `load_liquidations_tf`, `load_oi_tf`, `load_funding`, `compute_cross_coin_features`, `_try_load_with_pepe_fallback`, `extract_trade_records`, `load_btc_daily_returns`. Per-TP inference: `run_jensen_test` (analysis/jensen_alpha.py) + `compute_daily_metrics` / `simulate_smart_filter_windows` / `summarize_smart_filter_results` (scripts/smart_filter_adequacy.py).
+- **[scripts/test_flush_tp_research.py](scripts/test_flush_tp_research.py)** — repo-style standalone tests (PASS/FAIL counters, no pytest). 7 scenarios × multiple assertions = **25 total assertions**, all offline (synthetic data, `np.random.seed(42)`). Coverage: cluster identification + earliest-pick, no-cluster fallback → 8h time exit, TP-level math at 0.5/1.0/1.1, max-hold cap when TP not reached, 9-level sweep shape check, plateau monotonic-vs-spike detection, all 5 recommendation-label branches.
+
+### Recommendation labels
+
+| Condition | Label | Next session |
+|---|---|---|
+| SF_PASS ∧ plateau_confirmed ∧ Sharpe > baseline ∧ Jensen ≠ LEVERAGED_BETA | `DEPLOY_V2` | A.1 — paper-bot exit-logic update |
+| SF_PASS ∧ (no plateau ∨ Sharpe ≤ baseline) | `SF_PASS_MARGINAL` | discussion |
+| Sharpe > baseline ∧ Jensen ≠ LEVERAGED_BETA ∧ plateau ∧ ¬SF_PASS | `IMPROVEMENT_NO_SF` | Session Б (MAGNET_BOT diversifier) |
+| No TP level beats baseline | `NO_IMPROVEMENT` | Session Б directly |
+| ALL TPs classify LEVERAGED_BETA | `STRATEGY_QUESTIONABLE` | halt + architect review |
+
+Plateau rule: top TP (by pooled Sharpe) is **plateau-confirmed** iff its immediate neighbors in the ordered tp_levels list are both in the top-3 Sharpe ranking. Edge top (0.50 or 1.10) has one neighbor; that one must be in top-3. Guards against single-spike overfits.
+
+### Sample-adequacy caveat
+
+180-day backtest window; per-TP trade counts start at ~428 and drop as no-cluster fallback takes effect. If >30% of trades fall back to 8h time exit, the script flags `HIGH_FALLBACK_RATE` in the report — the sweep is then dominated by baseline behavior and the TP signal is diluted.
+
+### Result
+
+**TBD** — to be filled after architect-triggered VPS run. Report format:
+- Recommendation label + best TP level
+- Sharpe / Win% / Profit Factor / MaxDD at best TP vs baseline
+- Plateau confirmation status
+- Jensen α / β / R² at best TP
+- Smart Filter 30d adequacy metrics at best TP
+- SOL / ETH / DOGE per-coin breakdown
+- Any surprises (high fallback rate, Jensen instability)
+
+### Run
+
+```bash
+# Offline tests (no DB)
+.venv/bin/python scripts/test_flush_tp_research.py    # expect PASS: 25 | FAIL: 0
+
+# Real run (requires DB + ccxt internet)
+.venv/bin/python scripts/flush_tp_research.py
+# stdout: recommendation label + best TP level + key numbers
+# file:   analysis/flush_tp_research_<UTC-timestamp>.md
+```
+
+### Do NOT
+
+- Change locked L3b-2 thresholds (z_self=1.0, z_market=1.5, n_coins≥4) or `MARKET_FLUSH_FILTERS`.
+- Re-run the backtest itself — trade list comes from the locked L8 path via `extract_trade_records`.
+- Drop the 8h max-hold cap. Without it, TP > 1.0 could hold for days if the cluster is never reached, changing the risk profile entirely.
+- Modify `analysis/jensen_alpha.py`, `scripts/validate_h1_z15_h2.py`, `scripts/smart_filter_adequacy.py`, `scripts/backtest_market_flush_multitf.py`, or `scripts/backtest_combo.py` — all locked, import-only reuse.
+- Deploy to live on `DEPLOY_V2` alone. Paper-bot exit-logic update (Session A.1) + 14-day paper observation is mandatory before live.
+- Extend the TP grid beyond the 9 specified levels without separate ExitPlanMode approval (overfit risk grows with grid size).
+- Use per-level `hl_liquidation_map` data as substrate until it accumulates ≥ 60 days of coverage (~2026-06-18 earliest) — coinglass bar-level is the forced choice for this session.
+- Treat `STRATEGY_QUESTIONABLE` as a tunable — if all 9 TP levels classify LEVERAGED_BETA, architect review is required before any next step.
+
