@@ -1768,3 +1768,79 @@ Auto-halt: N-aware 100%-win OOS fold guard from `4026bb0` still active.
 - Build a live 30m collector in this session — backfill is sufficient for research; live collection belongs to L17 if PASS.
 - Extend the grid of intervals beyond `{h1, h2, h4, 30m}` without separate ExitPlanMode approval.
 
+## Session L-jensen (post-L16, 2026-04-18) — Jensen's Alpha Gate
+
+Goal: CAPM / Newey-West regression of `market_flush` h4 daily P&L on BTC daily returns to classify the strategy's edge as GENUINE_ALPHA / LEVERAGED_BETA / MIXED_ALPHA_BETA / WEAK_SIGNAL / NEGATIVE_ALPHA / INCONCLUSIVE.
+
+Files:
+- `analysis/jensen_alpha.py` — main script (~380 lines).
+- `scripts/test_jensen_alpha.py` — 9 test functions, 35 assertions PASS.
+- Report: `analysis/jensen_report_<timestamp>.md` (gitignored).
+
+First-run result (2026-04-18):
+- N = 148 daily observations (2025-11-18 → 2026-04-15).
+- α = +1.3577 pp/day (two-sided HAC p = 0.0555).
+- β = +1.6459 (HAC p = 0.15, not significant).
+- R² = 0.1244.
+- Subsample instability: first-half β = 0.24 / second-half β = 2.23.
+- **Verdict: INCONCLUSIVE** — α marginal, β unstable, clustering profile independently disqualifies Smart Filter (median 30d trading days = 8, required ≥ 14).
+
+Implication:
+- Binance lead-trader deployment deferred.
+- Jensen re-run planned after ≥ 60 paper observations (est. 2-3 months).
+- Smart Filter disqualification is the binding constraint regardless of α verdict.
+- L18 pivot: prioritize discrete event-based signals (L6b) over continuous positioning signals (funding / OI / CVD / NetPos — all rejected).
+
+## Session L18a — Liquidation Substrate Prep for L6b (2026-04-18)
+
+Goal: unblock the 2026-04-24 L6b Predictive Liquidation Magnet retest by (1) closing the PEPE coverage gap in `hl_liquidation_map` and (2) evaluating CoinGlass aggregated liquidation heatmap as a secondary substrate to cross-validate HL-only data.
+
+### Track 1 — PEPE coverage fix (COMPLETE)
+
+**Diagnosis.** The L18-prep state dump flagged PEPE absent from `hl_liquidation_map` and hypothesized a `canonical_coin()` regression. Exploration + live DB diagnosis proved otherwise:
+
+- `collectors/config.py:30-37` correctly defines `canonical_coin("kPEPE") == "PEPE"` and `hl_coin("PEPE") == "kPEPE"`.
+- `collectors/hl_snapshots.py:138` applies `canonical_coin` on insert — `hl_liquidation_map` and `hl_position_snapshots` store canonical names.
+- VPS query: zero `kPEPE` rows in either table (canonicalization is clean).
+- `hl_position_snapshots` had **1,802 PEPE rows / 24 h** across 21 whales, avg size $751 k, 1,081 rows with real (non-estimated) liquidation prices — rich data.
+- `hl_liquidation_map` had **zero** PEPE rows despite the upstream position data being fine.
+
+Root cause was a silent rounding bug in `collectors/config.py:price_step()`. For kPEPE (HL-reported mid ≈ 0.003821), `raw = current_price * 0.01 = 3.82e-5` fell into the old `else: return round(raw, 4)` branch, which returned `0.0`. `collectors/hl_snapshots.py:build_liquidation_map()` then silently skipped PEPE via the `if step <= 0: continue` guard, every 15-min cycle since the collector shipped. Not canonicalization. Not Scenario E (whales absent). Not a seed staleness issue. A numerical-resolution bug that only manifested on sub-cent-priced coins.
+
+**Fix.** `collectors/config.py:50-75` — added a `raw <= 0` early return and extended the elif chain down to `raw >= 1e-7` with an `else: return round(raw, 8) or raw` tail so a positive `raw` can never round to 0. The 9 previously-working coins hit identical branches as before — no historical re-bucketing. Regression test in `scripts/test_hl_canonicalization.py` (35 assertions across 3 blocks: canonicalization round-trip, `price_step` across all 10 coins at plausible prices including explicit PEPE @ 0.003821 → step 4e-05, and `build_liquidation_map` end-to-end emitting rows for synthetic PEPE positions with a `kPEPE` mid price). All PASS locally.
+
+**Deployment.** Commit `f915b5c`, `git pull` on VPS, `systemctl restart liq-hl-snapshots.service`. Verified 19 PEPE rows in `hl_liquidation_map` within 30 minutes. Live cycle steady-state thereafter.
+
+### Track 2 — CoinGlass liquidation heatmap (CANCELLED)
+
+**Goal.** Second substrate for L6b: Binance-aggregated liquidation heatmap to cross-validate HL-only `hl_liquidation_map`.
+
+**Outcome.** Endpoint exists at `/api/futures/liquidation/heatmap/model1` and `/model2` (confirmed via `docs.coinglass.com`). Required parameters: `exchange` (singular, e.g. `Binance`), `symbol` (trading pair, e.g. `BTCUSDT`), `range` (12h, 24h, 3d, 7d, 30d, 90d, 180d, 1y). Per-pair per-exchange (not aggregated across exchanges server-side — caller supplies a specific exchange). An initial probe hit 404s due to path/param guesses; the correct path was found via docs.
+
+User confirmed via CoinGlass dashboard screenshot that **both heatmap endpoints are gated to the Professional tier ($699/mo)**, not Startup ($79/mo). No live call was made with the corrected path because the tier block is upstream of the probe.
+
+**Decision.** Upgrading to Professional is not justified for a secondary substrate when HL primary substrate works. Track 2 closed. L6b proceeds on HL-only substrate per original roadmap.
+
+Artifacts:
+- `scripts/l18a_cg_heatmap_probe.py` was committed (`3ba6925`) then deleted in the L18a completion commit. The one-off SQL diagnosis `scripts/l18a_pepe_diagnosis.sql` (`fc4a0d3`) is retained in-tree as a reusable coverage-audit tool.
+
+### PEPE coverage asymmetry at L6b retest
+
+L18a fix deployed 2026-04-18 → ~6 days of PEPE data in `hl_liquidation_map` by the 2026-04-24 retest, vs ~11 days for the other 9 coins (which predate the fix). Acceptable for a first-pass L6b run — the analyzer already tolerates per-coin data-volume differences. If L6b PEPE-specific metrics land marginal (close to but not clearing the hit-rate and magnet-score thresholds), flag in L18b and re-run once PEPE accumulates a full window (est. 2026-05-01 for 13 days of coverage).
+
+### Deferred (do NOT touch as a side effect of L18a)
+
+- Jensen re-run — scheduled ≥ 2-3 months out after ≥ 60 paper observations accumulate.
+- Showcase deployment (`liq-showcase-bot` unit) — gated by L6b outcome + 14-day paper success per `LIVE_TRADING_MASTER_PLAN.md`.
+- L11 SHORT research.
+- CG heatmap backfill (no data source at current tier).
+- Any change to `market_flush` / `bot/` / `exchange/` / `telegram_bot/` — L18a is data-layer-only.
+
+### Do NOT
+
+- Re-diagnose PEPE canonicalization. It is and always was correct. The bug was in `price_step`.
+- Reintroduce the `raw < 0.001 → round(raw, 4)` shortcut — it is a silent zero-rounding trap for any future sub-cent listing.
+- Probe the CG heatmap endpoints again without tier upgrade authorization. They return Professional-tier denial at the gate; retrying burns API quota on our Startup tier key.
+- Upgrade CG tier on your own authority. Business-level decision.
+- Add new dependencies to `requirements.txt`.
+
