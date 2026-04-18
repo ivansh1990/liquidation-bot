@@ -247,6 +247,67 @@ def compute_clustering_metrics(daily_metrics: pd.DataFrame) -> dict:
 # Real-data loaders (DB + ccxt)
 # ---------------------------------------------------------------------------
 
+def _load_h4_substrate() -> dict[str, pd.DataFrame]:
+    """
+    Local h4 substrate loader. Mirrors `_load_coins_for_interval("h4")` from
+    research_netposition.py minus the NetPos attach (irrelevant for
+    market_flush) and uses `_interval_to_ccxt_timeframe` to build a valid
+    ccxt timeframe string. The L16 `bar_minutes` refactor turned
+    `_interval_to_bar_hours("h4")` into the float `4.0`, so the original
+    `f"{bar_hours}h"` construction in research_netposition.py now produces
+    the invalid `"4.0h"` (rejected by Binance with -1120). We bypass it.
+    """
+    from collectors.config import COINS, binance_ccxt_symbol
+    from backtest_market_flush_multitf import (
+        _interval_to_bar_hours,
+        _interval_to_ccxt_timeframe,
+        build_features_tf,
+        fetch_klines_ohlcv,
+        load_funding,
+        load_liquidations_tf,
+        load_oi_tf,
+        CROSS_COIN_FLUSH_Z,
+    )
+    from backtest_combo import (
+        _try_load_with_pepe_fallback,
+        compute_cross_coin_features,
+    )
+
+    bar_hours = _interval_to_bar_hours("h4")
+    timeframe = _interval_to_ccxt_timeframe("h4")
+
+    per_coin: dict[str, pd.DataFrame] = {}
+    for coin in COINS:
+        liq_sym, liq_df = _try_load_with_pepe_fallback(
+            coin, lambda s: load_liquidations_tf(s, "h4"),
+        )
+        _, oi_df = _try_load_with_pepe_fallback(
+            coin, lambda s: load_oi_tf(s, "h4"),
+        )
+        _, fund_df = _try_load_with_pepe_fallback(coin, load_funding)
+
+        if liq_df.empty:
+            print(f"  {coin:<5}: no liquidation data — skipped")
+            per_coin[coin] = pd.DataFrame()
+            continue
+        ccxt_sym = binance_ccxt_symbol(coin)
+        since_ms = int(liq_df["timestamp"].min().timestamp() * 1000)
+        try:
+            ohlcv_df = fetch_klines_ohlcv(ccxt_sym, since_ms, timeframe)
+        except Exception as e:
+            print(f"  {coin:<5}: ccxt fetch failed ({e}) — skipped")
+            per_coin[coin] = pd.DataFrame()
+            continue
+
+        feat = build_features_tf(
+            coin, liq_sym, liq_df, oi_df, fund_df, ohlcv_df, bar_hours,
+        )
+        per_coin[coin] = feat
+        print(f"  {coin:<5}: rows={len(feat)}")
+
+    return compute_cross_coin_features(per_coin, flush_z=CROSS_COIN_FLUSH_Z)
+
+
 def load_market_flush_daily_pnl() -> tuple[pd.Series, pd.DataFrame, list[dict]]:
     """
     Reconstruct the locked h4 `market_flush` trade list from DB substrate and
@@ -263,7 +324,6 @@ def load_market_flush_daily_pnl() -> tuple[pd.Series, pd.DataFrame, list[dict]]:
     """
     from collectors.config import get_config
     from collectors.db import init_pool
-    from research_netposition import _load_coins_for_interval
     from backtest_market_flush_multitf import (
         MARKET_FLUSH_FILTERS, RANK_HOLDING_HOURS,
     )
@@ -272,7 +332,7 @@ def load_market_flush_daily_pnl() -> tuple[pd.Series, pd.DataFrame, list[dict]]:
 
     init_pool(get_config())
     print("Loading h4 coin dataframes (substrate for market_flush) ...")
-    h4_dfs = _load_coins_for_interval("h4")
+    h4_dfs = _load_h4_substrate()
     trades = extract_trade_records(
         h4_dfs, list(MARKET_FLUSH_FILTERS), RANK_HOLDING_HOURS,
     )
