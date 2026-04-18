@@ -1,9 +1,9 @@
 # Liquidation Bot — State Dump for L18 Planning
 
-**Generated:** 2026-04-18 (dev box, Darwin 24.6.0; not VPS)
+**Generated:** 2026-04-18 (dev box, Darwin 24.6.0; live VPS data integrated from `scripts/vps_state_dump.sh` run at 11:33 UTC)
 **Repo:** `/Users/ivanshytikov/liquidation-bot`
-**Branch:** `master`, clean, top commit `264c4c8 l-jensen: local h4 loader to bypass L16 bar_hours float bug`
-**Source authority:** [CLAUDE.md](../CLAUDE.md) (1500+ lines, comprehensive through L16) + on-disk artifacts. Live DB is on the VPS, not reachable from dev box — see Section 7 for the companion shell script that must be run there.
+**Branch:** dev box at `master` / `264c4c8` (l-jensen). **VPS is one commit ahead at `d5672fc l18 invistigate licvidation bot strategy`** — architect should `git pull` before drafting L18 plan.
+**Source authority:** [CLAUDE.md](../CLAUDE.md) (1500+ lines, comprehensive through L16) + on-disk artifacts + VPS systemd / Postgres / journal data. See §7 for VPS dump details.
 
 ---
 
@@ -36,14 +36,14 @@ Quick reference for terms used through this document.
 
 | Module | Source | Storage | Frequency | Running on VPS? | Last record |
 |---|---|---|---|---|---|
-| [collectors/hl_websocket.py](../collectors/hl_websocket.py) | Hyperliquid `wss://api.hyperliquid.xyz/ws` (live trades) | (in-memory; no DB writes from this process per CLAUDE.md) | Event-driven (continuous WS) | unknown — run `scripts/vps_state_dump.sh` | n/a (not a table) |
-| [collectors/hl_snapshots.py](../collectors/hl_snapshots.py) | Hyperliquid REST `POST /info clearinghouseState` per address + `allMids` | `hl_position_snapshots`, `hl_liquidation_map`, `hl_addresses` | Timer `*:0/15` (every 15 min) | unknown | unknown — VPS only |
-| [collectors/binance_collector.py](../collectors/binance_collector.py) | Binance Futures public REST: OI, funding, L/S ratio, taker | `binance_oi`, `binance_funding`, `binance_ls_ratio`, `binance_taker` | Timer `hourly` | unknown | unknown |
-| [collectors/coinglass_oi_collector.py](../collectors/coinglass_oi_collector.py) | CoinGlass `/api/futures/open-interest/aggregated-history?interval=h4` + `/funding-rate/oi-weight-history?interval=h8` (Binance only) | `coinglass_oi`, `coinglass_funding` | Timer `*-*-* 00,04,08,12,16,20:05:00 UTC` (4H + 5 min buffer) | unknown | unknown |
-| [bot/signal.py:SignalComputer.fetch_recent_liquidations](../bot/signal.py) | CoinGlass `/api/futures/liquidation/aggregated-history?interval=h4` (called by paper bot every cycle) | `coinglass_liquidations` (side-effect insert; not its own collector) | 4H-aligned + 5 min buffer (whenever paper bot runs) | depends on paper bot service status | unknown |
-| [bot/scheduler.py](../bot/scheduler.py) (paper bot) | Aggregates signal + executes paper orders | `state/paper_state.json` | 4H-aligned + 5 min buffer | unknown — see §4 | n/a |
-| [exchange/scheduler.py](../exchange/scheduler.py) (showcase bot) | Real Binance Futures execution | exchange-side orders + state (per L7 design) | 4H-aligned + 5 min buffer | per L7 spec: NOT enabled by default | n/a |
-| [telegram_bot/app.py](../telegram_bot/app.py) | Telegram `getUpdates` long-poll | None (read-only) | Continuous long-poll | unknown | n/a |
+| [collectors/hl_websocket.py](../collectors/hl_websocket.py) | Hyperliquid `wss://api.hyperliquid.xyz/ws` (live trades) | (in-memory; no DB writes from this process — `LARGE TRADE` log lines only) | Event-driven (continuous WS) | ✅ active (`liq-hl-websocket.service`) | n/a (not a table); last log line 2026-04-18 11:33:21 UTC |
+| [collectors/hl_snapshots.py](../collectors/hl_snapshots.py) | Hyperliquid REST `POST /info clearinghouseState` per address + `allMids` | `hl_position_snapshots`, `hl_liquidation_map`, `hl_addresses` | Timer `*:0/15` (every 15 min) | ✅ enabled timer (last fired 11:30:17, next 11:45:00) | `hl_liquidation_map.max(snapshot_time) = 2026-04-18 11:30 UTC` |
+| [collectors/binance_collector.py](../collectors/binance_collector.py) | Binance Futures public REST: OI, funding, L/S ratio, taker | `binance_oi`, `binance_funding`, `binance_ls_ratio`, `binance_taker` | Timer `hourly` | ✅ enabled (last fired 11:00:17, 14s, 0 errors) | `binance_oi`, `binance_ls_ratio` → 2026-04-18 11:00 UTC |
+| [collectors/coinglass_oi_collector.py](../collectors/coinglass_oi_collector.py) | CoinGlass `/api/futures/open-interest/aggregated-history?interval=h4` + `/funding-rate/oi-weight-history?interval=h8` (Binance only) | `coinglass_oi`, `coinglass_funding` | Timer `*-*-* 00,04,08,12,16,20:05:00 UTC` (4H + 5 min buffer) | ✅ enabled (last fired 08:05:00 → +10 OI rows / +10 funding rows; next 12:05:00) | `coinglass_oi.max = 2026-04-18 08:00 UTC` |
+| [bot/signal.py:SignalComputer.fetch_recent_liquidations](../bot/signal.py) | CoinGlass `/api/futures/liquidation/aggregated-history?interval=h4` (called by paper bot every cycle) | `coinglass_liquidations` (side-effect insert; not its own collector) | 4H-aligned + 5 min buffer (whenever paper bot runs) | ✅ active via paper bot | `coinglass_liquidations.max = 2026-04-18 08:00 UTC` |
+| [bot/scheduler.py](../bot/scheduler.py) (paper bot) | Aggregates signal + executes paper orders | `state/paper_state.json` | 4H-aligned + 5 min buffer | ✅ active (`liq-paper-bot.service`); last cycle 08:05 UTC, equity $1014.13, 5 trades closed, 100% win | n/a |
+| [exchange/scheduler.py](../exchange/scheduler.py) (showcase bot) | Real Binance Futures execution | exchange-side orders + state (per L7 design) | 4H-aligned + 5 min buffer | **❌ inactive; unit `enabled=not-found` on VPS** (file in repo but not installed at `/etc/systemd/system/`). Stale `state/showcase_state.json.lock` remains | n/a |
+| [telegram_bot/app.py](../telegram_bot/app.py) | Telegram `getUpdates` long-poll | None (read-only) | Continuous long-poll | ✅ active since 2026-04-15 16:50 UTC, authorized chat `229287803` | n/a |
 
 **Systemd units present** (in repo at [systemd/](../systemd/)):
 
@@ -57,9 +57,9 @@ Quick reference for terms used through this document.
 | `liq-showcase-bot.service` | simple | `Restart=always`, `RestartSec=30` |
 | `liq-telegram-bot.service` | simple | `Restart=always`, `RestartSec=30` |
 
-No `docker-compose.yml`, no `crontab`. Pure systemd deploy.
+No `docker-compose.yml` in this repo, no `crontab` for liquidation-bot. **However** the VPS hosts an out-of-repo Docker stack (`grafana` + `prometheus`, both up 10 days) plus several non-liquidation-bot strategy services (`aggressive`, `momentum`, `strategy_2h`, `leaderboard`, `portfolio`, plus a separate `telegram-bot.service`). See **§7 Notable additions discovered** for the full list — these are not part of the liquidation-bot codebase and may be a parallel project on the same host.
 
-**Last-record timestamps for all tables:** unknown — local Postgres unreachable from dev box (`psql: connection to server on socket "/tmp/.s.PGSQL.5432" failed`). Run [scripts/vps_state_dump.sh](../scripts/vps_state_dump.sh) on VPS for live counts.
+**Last-record timestamps for all tables:** see live data in §7 — full count + min/max for all 22 tables. All liquidation-bot collectors are healthy and current.
 
 ---
 
@@ -85,17 +85,18 @@ No `docker-compose.yml`, no `crontab`. Pure systemd deploy.
 | **Binance order book / tick / trades** | None | None | n/a | **NOT collected.** No code references; would require `wss://fstream.binance.com` + new schema |
 | **Multi-exchange (OKX, Bybit, Bitget, dYdX)** | None directly. CoinGlass aggregates Binance + OKX + Bybit + Bitget + Hyperliquid + dYdX server-side via `exchange_list` param (L8 baseline) | n/a (only the aggregate is stored) | n/a | We rely on CoinGlass aggregation, never query other exchanges directly. Bitget pinged in `telegram_bot/health.py:152` as a liveness probe only |
 
-### Concrete row counts
+### Concrete row counts (live from VPS, 2026-04-18 11:33 UTC)
 
-**Unknown — local DB unreachable from dev box.** All counts must be obtained from VPS via [scripts/vps_state_dump.sh](../scripts/vps_state_dump.sh) §5 / §6.
+Full per-table breakdown is in **§7 Postgres tables — live row counts**. Headlines:
 
-Expected order-of-magnitude (per CLAUDE.md):
-- `coinglass_oi` (h4): ~10,000 rows (10 coins × 1000 buckets)
-- `coinglass_funding` (h8): ~5,400 rows
-- `coinglass_liquidations_30m`: ~43,200 rows (10 × 4320; first run April 17)
-- `hl_liquidation_map`: ~2,800 unique snapshot×coin pairs after ~3 days (per L6 estimate)
-- `coinglass_netposition_h1`: ~43,200 rows (10 × 4320 over 180 days)
-- `coinglass_cvd_h1`: same shape
+- `hl_liquidation_map`: **114,901** rows (vs L6 estimate of ~2,800 after 3 days — actual rate is ~10× higher; 4d 15h coverage is well above the 8,000-row L6b pre-flight floor).
+- `hl_position_snapshots`: **141,078** rows over 4d 16h.
+- `coinglass_liquidations` (h4): **10,230** rows over 171 days; live updates via paper-bot side-effect insert.
+- `coinglass_liquidations_h1` / `_h2`: 43,200 / 21,600 — full 180 days, but **stale by 2 days** (no live collector; last manual backfill 2026-04-16).
+- `coinglass_liquidations_30m`: **43,200** rows over 90 days; stale by 19 hours.
+- `coinglass_oi_30m`: **🚨 0 rows** — was apparently never backfilled (table created by L16 code, but the OI half of the L16 backfill did not run or used `--skip-oi`).
+- `coinglass_netposition_h1/h2/h4`, `coinglass_cvd_h1/h2/h4`: all populated to 180-day cap, all stale by 1–2 days (no live collectors).
+- Binance live tables (`binance_oi/funding/ls_ratio/taker`): all current (max ts within the last hour).
 
 ---
 
@@ -108,7 +109,7 @@ Per [CLAUDE.md](../CLAUDE.md) "Tested-and-Rejected Approaches" table + per-sessi
 | L1 | (Initial collectors) | Stand up Hyperliquid + Binance public data feeds | DONE | n/a — infrastructure only | [collectors/](../collectors/) |
 | L2 | `liquidation_flush` H1/H2/H3 baseline | Liquidation asymmetry → mean-reversion bounce | LOCKED BASELINE | Forms the substrate for all later research; not "passed" but used as reference | [scripts/backtest_liquidation_flush.py](../scripts/backtest_liquidation_flush.py) |
 | L3 | Walk-forward + ATR stops + heatmap overlay | Validate L2 on 6-fold WF; size with ATR-based TP/SL | PARTIAL — only SOL passed walk-forward standalone | "5 altcoins failed" (CLAUDE.md L3b-2 motivation line) | [scripts/walkforward_h1_flush.py](../scripts/walkforward_h1_flush.py), [scripts/backtest_h1_with_stops.py](../scripts/backtest_h1_with_stops.py), [scripts/analyze_heatmap_signal.py](../scripts/analyze_heatmap_signal.py) |
-| L3a | Bitget leaderboard analytics prototype | (mentioned only as Variant D fallback in master plan) | DEFERRED | Not part of trading critical path | (no script in repo with `L3a` prefix; mention only in `LIVE_TRADING_MASTER_PLAN.md`) |
+| L3a | Bitget leaderboard analytics prototype | (mentioned as Variant D Option 3 fallback in master plan) | **DEPLOYED on VPS** as `leaderboard.service` ("Bitget Leaderboard Copy Trading Tracker"), active at dump time | No code in this repo — runs from a separate codebase on the same host. Confirms Variant-D-Option-3 is partially live already | (out-of-repo; service unit only) |
 | L3b-1 | CoinGlass OI + funding backfill | Extend OI / funding history beyond Binance's 21-day window | DONE | Data layer; enabled L3b-2 | [scripts/backfill_coinglass_oi.py](../scripts/backfill_coinglass_oi.py) |
 | L3b-2 | Combo signal backtest (9 combos × 10 coins) | Combine flush + OI + funding + breadth filters | **PASS — `market_flush` discovered.** Locked: `z_self>1.0` + `n_coins>=4`. Pooled Sharpe 5.60, Win 60.7%, N=422 | Single passing combo; the rest documented as also-rans | [scripts/backtest_combo.py](../scripts/backtest_combo.py); analysis dump per CLAUDE.md: `analysis/combo_L3b.txt` (not present in [analysis/](.) on this machine — likely VPS-only or untracked) |
 | L4 | Paper trading bot | Deploy `market_flush` h4 to live paper trading | DONE | Bot stands; state file empty on dev box (see §4) | [bot/](../bot/), [scripts/test_paper_bot.py](../scripts/test_paper_bot.py) (19 assertions PASS) |
@@ -167,11 +168,11 @@ Per [CLAUDE.md](../CLAUDE.md) "Tested-and-Rejected Approaches" table + per-sessi
 | Exchange | Paper-only, ccxt Binance USDM Futures `BTC/USDT:USDT` for ticker prices (live ticker for entry, no real orders) |
 | Started (per `LIVE_TRADING_MASTER_PLAN.md`) | **2026-04-15** |
 | State file path | `state/paper_state.json` |
-| **State on dev box (this machine)** | **MISSING** — only `.gitkeep` present in `state/`. `paper_state.json` does not exist locally |
-| **Diagnosis** | Paper bot has not been run on this dev box. Systemd services [systemd/liq-paper-bot.service](../systemd/liq-paper-bot.service) target `/home/ivan/liquidation-bot/.venv/...` (Linux VPS path), not the macOS dev box. Empty state here is expected behavior; the live state lives on the VPS only |
-| **State on VPS** | unknown — must run [scripts/vps_state_dump.sh](../scripts/vps_state_dump.sh) §9. Section 9 of the script invokes Python to read `capital`, `positions[]`, `closed_trades[]`, `equity_history[]`, `last_summary_date` from the JSON |
-| Trades closed in paper | unknown — same |
-| Active monitoring | Telegram bot (commands `/status`, `/pnl`, `/trades`, `/positions`, `/health`, `/config`, `/help`) per L5; daily summary at 00:05 UTC; 4-API health pings (Binance, CoinGlass, Hyperliquid, Bitget) |
+| **State on dev box (this machine)** | **MISSING** — only `.gitkeep` present in `state/`. `paper_state.json` does not exist locally; expected, since systemd unit targets the Linux VPS path |
+| **State on VPS** (live, 2026-04-18 11:33 UTC) | `capital = $1014.13` (started $1000.00 → **+1.41 %**); `open_positions = 0`; `closed_trades = 5`; `equity_history` length 5; `last_summary_date = 2026-04-18` |
+| Trades closed in paper | **5**; per `liq-paper-bot` log win rate **100.0 %** (very small N — not statistically meaningful yet) |
+| Last cycle | 2026-04-18 08:05:31 UTC — `is_flush=False n_flushing=0`, no entries; sleeping until 12:05:00. Next cycle in ~30 min from VPS dump |
+| Active monitoring | Telegram bot (commands `/status`, `/pnl`, `/trades`, `/positions`, `/health`, `/config`, `/help`) per L5; daily summary at 00:05 UTC; 4-API health pings (Binance, CoinGlass, Hyperliquid, Bitget). Authorized chat `229287803` |
 
 ### Live execution path
 
@@ -242,46 +243,125 @@ No artifact mentions cross-exchange arbitrage (basis trades, funding arbitrage, 
 
 ## §7 Current VPS state
 
-**This dev box is Darwin, not the production VPS.** The following commands were run locally and reflect dev-box state only:
+Live data from `scripts/vps_state_dump.sh` run on the production VPS at **2026-04-18 11:33 UTC**.
 
-```
-$ uname -a
-Darwin 24.6.0  (per environment block)
-$ systemctl list-units ...
-(unavailable on Darwin)
-$ docker ps
-(no docker installed; project is pure systemd, no compose file)
-$ tmux list-sessions
-(unknown — not run, dev box not running tmux for this project)
-$ psql -d liquidation -c '\dt'
-psql: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed:
-  No such file or directory  (no local Postgres on dev box)
-```
+### Host
 
-### What to run on the VPS
+| Field | Value |
+|---|---|
+| Host | `ubuntu-4gb-nbg1-1` (Hetzner Cloud Nuremberg, 4GB) |
+| OS | Ubuntu 24.04.4 LTS (Noble Numbat), kernel 6.8.0-106 |
+| Uptime | 16 days 17 hours |
+| Load avg | 0.00 / 0.00 / 0.00 (idle) |
+| User | `ivan` |
+| Disk | 19G / 75G used (27%) — comfortable headroom |
+| Project size | `~/liquidation-bot` = 493 MB; `analysis/` = 460 KB; `state/` = 12 KB |
+| Postgres data dir | unknown (sudo password required for `du`) |
 
-`scripts/vps_state_dump.sh` (newly added) is a **read-only** shell script. It:
+### **🚨 Notable additions discovered (NOT documented in CLAUDE.md)**
 
-1. Sources `~/liquidation-bot/.env` for DB credentials.
-2. Prints `uname`, `uptime`, OS release, current UTC time.
-3. Lists all systemd services + timers; reports `is-active`/`is-enabled` per liquidation unit.
-4. Gracefully reports docker and tmux as not-installed (expected).
-5. Probes Postgres connectivity; if connected, reports `count + min(timestamp) + max(timestamp)` for **all 22 tables** in the documented schema (incl. inline-created `coinglass_*_h1/h2/30m`, `coinglass_netposition_*`, `coinglass_cvd_*`).
-6. Per-coin row count + first/last day for `hl_liquidation_map` (the L6b retest pre-flight check from `parking_lot_ideas.md`).
-7. Top 15 tables by `pg_total_relation_size`.
-8. `df -h` on `/` and the project root, `du -sh` on `state/`, `analysis/`, `logs/`, and Postgres data dir if accessible.
-9. Reads `state/paper_state.json` and prints capital / positions / closed_trades / equity_history length.
-10. Last 30 lines of `journalctl` per liquidation unit.
-11. Errors in the last hour across all liquidation units.
-12. `git rev-parse --abbrev-ref HEAD`, `git log --oneline -10`, `git status -sb`.
+The VPS hosts a parallel set of strategies, tooling, and observability that are not part of the liquidation-bot repo or its CLAUDE.md sessions. Architect should know these exist before scoping L18:
 
-**Run on VPS:**
+1. **Docker observability stack — running 10 days**:
+   - `grafana` (`grafana/grafana:latest`) — dashboards
+   - `prometheus` (`prom/prometheus:latest`) — metrics scrape
+   - **No `docker-compose.yml` in this repo.** These containers are deployed outside the liquidation-bot codebase.
+2. **Other strategy services running side-by-side** (per `systemctl list-units`):
+   - `aggressive.service` — "Aggressive 1H Momentum Strategy (Paper)" — **active**
+   - `momentum.service` — "Momentum Cross-Sectional Strategy (Paper)" — **active**
+   - `momentum-healthcheck.service` + `.timer` — **active**, fires every 30 min
+   - `strategy_2h.service` — "Strategy-2H Cross-Sectional Momentum (Paper)" — **active**
+   - `leaderboard.service` — "Bitget Leaderboard Copy Trading Tracker" — **active** (this is the L3a / Variant-D-Option-3 prototype mentioned in `LIVE_TRADING_MASTER_PLAN.md` — already deployed)
+   - `portfolio.service` + `portfolio.timer` — "Daily Portfolio Summary Report", fires `00:05 UTC` daily
+   - `telegram-bot.service` — "Telegram Status Bot" — **separate from `liq-telegram-bot.service`**
+3. **Tmux session `showcase`** open since 2026-04-16 — interactive workspace, not in any service file.
+4. **Untracked git artifacts** — repo on VPS is at `master` (origin synced) but has many untracked files: `analysis/*.txt` (16 result files from L2/L3/L8/L10/L13/L14/L15/L16 runs that were never committed) plus several **likely-accidental shell-redirect outputs at repo root**: files literally named `1`, `1.0`, `2.0`, `55%`, `REJECT_BOTH`. **Worth cleaning up** but no functional impact.
+5. **`state/showcase_state.json.lock` exists** — `liq-showcase-bot.service` was started at some point even though it's currently inactive; the lock file is stale.
+6. **L18 commit `d5672fc l18 invistigate licvidation bot strategy` is on VPS HEAD** — dev-box gitStatus showed `264c4c8` (L-jensen) as top commit, so dev box is **one commit behind VPS** for the L18 work. Architect should `git pull` before drafting L18 plan.
 
-```bash
-cd ~/liquidation-bot
-bash scripts/vps_state_dump.sh > /tmp/vps_state_$(date -u +%Y%m%dT%H%M%SZ).txt 2>&1
-cat /tmp/vps_state_*.txt
-```
+### Liquidation-bot systemd unit state
+
+| Unit | Active | Enabled | Last run / signal |
+|---|---|---|---|
+| `liq-hl-websocket.service` | ✅ active (running) | enabled | Streaming continuously, last `LARGE TRADE` log @ 11:33:21 UTC |
+| `liq-hl-snapshots.service` (oneshot) | inactive (idle) | enabled via timer | Last fired 11:30:17, next 11:45:00 (`*:0/15`). Each run takes ~31s, finds ~314 positions, 256 map levels |
+| `liq-binance.service` (oneshot) | inactive (idle) | enabled via timer | Last fired 11:00:17, next 12:00:00 (`hourly`). Each run ~14s, 0 errors |
+| `liq-coinglass-oi.service` (oneshot) | inactive (idle) | enabled via timer | Last fired 08:05:00, next 12:05:00. Last run +10 OI rows, +10 funding rows, 0 errors |
+| `liq-paper-bot.service` | ✅ active (running) | enabled | Last cycle 08:05:00 — `is_flush=False`, no entries; sleeping until 12:05:00. **5 trades closed lifetime, 100% win, equity $1014.13** |
+| `liq-showcase-bot.service` | ❌ inactive (dead) | **`enabled=not-found`** (unit file not installed at `/etc/systemd/system/`) | No journal entries (never started). **Showcase trading is not deployed.** |
+| `liq-telegram-bot.service` | ✅ active (running) | enabled | Started 2026-04-15 16:50; authorized chat 229287803 |
+
+**Errors in last hour (all liquidation units):** none.
+
+### Postgres tables — live row counts
+
+Connection via `localhost:5432` as `postgres` to db `liquidation` succeeded.
+
+| Table | Rows | Min ts | Max ts | Notes |
+|---|---:|---|---|---|
+| `hl_addresses` | 500 | 2026-04-13 19:35 | 2026-04-13 19:35 | Seeded once, no updates |
+| `hl_position_snapshots` | **141,078** | 2026-04-13 19:35 | 2026-04-18 11:30 | 4d 16h coverage |
+| `hl_liquidation_map` | **114,901** | 2026-04-13 19:35 | 2026-04-18 11:30 | Same span; **L6b retest substrate** |
+| `binance_oi` | 6,130 | 2026-03-24 16:00 | 2026-04-18 11:00 | ~25 days, hourly |
+| `binance_funding` | 1,152 | 2026-03-15 12:00 | 2026-04-18 16:00 | ~34 days |
+| `binance_ls_ratio` | 5,847 | 2026-03-24 16:00 | 2026-04-18 11:00 | ~25 days |
+| `binance_taker` | 5,950 | 2026-03-24 15:00 | 2026-04-18 09:00 | ~25 days |
+| `coinglass_liquidations` (h4) | 10,230 | 2025-10-30 | 2026-04-18 08:00 | 171 days, 10 coins × ~1023 |
+| `coinglass_liquidations_h1` | 43,200 | 2025-10-18 20:00 | 2026-04-16 19:00 | 180 days, 10 × 4320. **Stale by 2 days** — last manual backfill, no live collector |
+| `coinglass_liquidations_h2` | 21,600 | 2025-10-18 20:00 | 2026-04-16 18:00 | Same staleness |
+| `coinglass_liquidations_30m` | 43,200 | 2026-01-17 16:30 | 2026-04-17 16:00 | 90 days, L16 backfill. **Stale by 19h** |
+| `coinglass_oi` (h4) | 10,170 | 2025-10-30 04:00 | 2026-04-18 08:00 | Live via `liq-coinglass-oi.timer`, current |
+| `coinglass_oi_h1` | 43,200 | 2025-10-18 20:00 | 2026-04-16 19:00 | Stale by 2 days |
+| `coinglass_oi_h2` | 21,600 | 2025-10-18 20:00 | 2026-04-16 18:00 | Stale by 2 days |
+| `coinglass_oi_30m` | **0** | — | — | **🚨 EMPTY** despite L16 plan calling for 30m OI backfill. CLAUDE.md L16 documents the table existing but the data layer was apparently not backfilled (script supports `--skip-oi` flag — likely run with it accidentally) |
+| `coinglass_funding` | 5,510 | 2025-10-17 | 2026-04-18 08:00 | Live, current |
+| `coinglass_netposition_h1` | 43,200 | 2025-10-18 21:00 | 2026-04-16 20:00 | Stale by 2 days |
+| `coinglass_netposition_h2` | 21,600 | 2025-10-18 22:00 | 2026-04-16 20:00 | Stale by 2 days |
+| `coinglass_netposition_h4` | 10,800 | 2025-10-19 00:00 | 2026-04-16 20:00 | Stale by 2 days |
+| `coinglass_cvd_h1` | 43,200 | 2025-10-19 07:00 | 2026-04-17 06:00 | Stale by 1.2 days |
+| `coinglass_cvd_h2` | 21,600 | 2025-10-19 08:00 | 2026-04-17 06:00 | Same |
+| `coinglass_cvd_h4` | 10,800 | 2025-10-19 08:00 | 2026-04-17 04:00 | Same |
+
+**Top 5 tables by size:** `hl_position_snapshots` 27 MB · `hl_liquidation_map` 14 MB · `coinglass_netposition_h1` / `_liquidations_h1` / `_oi_h1` ~7.5 MB each. Total schema fits comfortably; Postgres is not a constraint.
+
+### `hl_liquidation_map` per-coin coverage (L6b pre-flight)
+
+Per the `parking_lot_ideas.md` Idea #7 checklist (≥7 calendar days needed by 2026-04-24):
+
+| Coin | Snapshots | First | Last | Span |
+|---|---:|---|---|---|
+| ARB | 3,157 | 2026-04-13 | 2026-04-18 | 4d 15h |
+| AVAX | 9,767 | 2026-04-13 | 2026-04-18 | 4d 15h |
+| BTC | 34,201 | 2026-04-13 | 2026-04-18 | 4d 15h |
+| DOGE | 10,612 | 2026-04-13 | 2026-04-18 | 4d 15h |
+| ETH | 22,616 | 2026-04-13 | 2026-04-18 | 4d 15h |
+| LINK | 7,270 | 2026-04-13 | 2026-04-18 | 4d 15h |
+| SOL | 13,778 | 2026-04-13 | 2026-04-18 | 4d 15h |
+| SUI | 7,778 | 2026-04-13 | 2026-04-18 | 4d 15h |
+| WIF | 5,722 | 2026-04-13 | 2026-04-18 | 4d 15h |
+| **PEPE** | **— (missing from per-coin output)** | — | — | **🚨 Verify whether PEPE is being collected at all** — could be a `canonical_coin()` mapping issue (HL stores `kPEPE` but `hl_snapshots.py` is supposed to canonicalize). |
+
+**L6b retest readiness assessment:** at 4d 15h on 2026-04-18, the 7-day prerequisite hits on **2026-04-20 ~10:35 UTC** — comfortably ahead of the scheduled 2026-04-24 retest. Total `hl_liquidation_map` row count = 114,901 (well above the 8,000-row pre-flight floor). **Open issue: PEPE coverage** — must be resolved before retest, otherwise altcoin pool drops from 10 to 9.
+
+### Paper trading state (live from `state/paper_state.json`)
+
+| Field | Value |
+|---|---|
+| `capital` | **$1014.13** (started $1000.00 → +1.41%) |
+| `open_positions` | 0 |
+| `closed_trades` | **5** |
+| `equity_history` length | 5 |
+| `last_summary_date` | 2026-04-18 |
+| Win rate (per `liq-paper-bot` log) | **100.0%** (small N) |
+| Last cycle | 2026-04-18 08:05 UTC, signal `is_flush=False n_flushing=0` (no entries) |
+
+5 wins on 5 trades = positive sample but extremely small N — not yet meaningful for Smart Filter adequacy. All recent cycles show `is_flush=False`, consistent with CLAUDE.md's "clustering: 41 active days / 148" finding (most cycles produce no signal).
+
+### Git state on VPS
+
+- Branch `master`, synced with `origin/master`.
+- HEAD = `d5672fc l18 invistigate licvidation bot strategy` (one commit ahead of dev box, which sits at `264c4c8`).
+- Untracked: 16 `analysis/*.txt` result files + 5 likely-accidental root-level files (`1`, `1.0`, `2.0`, `55%`, `REJECT_BOTH`) + `state/showcase_state.json.lock`.
 
 ---
 
